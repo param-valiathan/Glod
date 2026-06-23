@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Sensor data (raw CSV recordings — large, not versioned)
+SN*.txt
+
+# Dev/local files
+CLAUDE.md
+launch_glod.bat
+
+# App-generated output
+glod_output_*/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
