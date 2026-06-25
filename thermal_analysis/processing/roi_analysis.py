@@ -9,7 +9,7 @@ Sources:
 
 import numpy as np
 import pandas as pd
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, label as _label
 from scipy.signal import savgol_filter as _savgol
 from scipy.ndimage import gaussian_filter1d
 
@@ -82,6 +82,63 @@ def find_roi_static(grid_2d: np.ndarray, roi_x: int, roi_y: int,
     return grid_2d[y0:y1, x0:x1]
 
 
+def find_roi_blob(grid_2d: np.ndarray, min_blob_px: int = 20,
+                  temp_threshold: float = 30.0):
+    """
+    Find the largest connected region at or above temp_threshold.
+
+    Returns a dict with roi_mean, roi_max, max_row, max_col, max_temp,
+    blob_size, or None if no region meets the min_blob_px criterion.
+    Intended for tracking a moving animal: urine spots and small artefacts
+    are suppressed by the size gate.
+    """
+    hot = grid_2d >= temp_threshold
+    if not hot.any():
+        return None
+
+    labeled, n_labels = _label(hot)
+    if n_labels == 0:
+        return None
+
+    # Pick the largest connected blob
+    sizes = np.array([(labeled == i).sum() for i in range(1, n_labels + 1)])
+    best_label = int(np.argmax(sizes)) + 1
+    best_size = int(sizes.max())
+
+    if best_size < min_blob_px:
+        return None
+
+    blob_mask = labeled == best_label
+    rows, cols = np.where(blob_mask)
+    blob_pixels = grid_2d[blob_mask]
+
+    hot_local = int(np.argmax(blob_pixels))
+    return {
+        "roi_mean": float(blob_pixels.mean()),
+        "roi_max": float(blob_pixels.max()),
+        "max_row": int(rows[hot_local]),
+        "max_col": int(cols[hot_local]),
+        "max_temp": float(blob_pixels.max()),
+        "blob_size": best_size,
+    }
+
+
+def apply_arena_mask(grid_2d: np.ndarray, arena_x: int, arena_y: int,
+                     arena_w: int, arena_h: int) -> np.ndarray:
+    """
+    Return grid_2d with pixels outside the arena rectangle set to
+    (min - 1) so they are never selected as the ROI hotspot.
+    """
+    cold = float(grid_2d.min()) - 1.0
+    masked = np.full(grid_2d.shape, cold, dtype=np.float64)
+    h, w = grid_2d.shape
+    x0, y0 = max(0, arena_x), max(0, arena_y)
+    x1, y1 = min(w, x0 + arena_w), min(h, y0 + arena_h)
+    if x1 > x0 and y1 > y0:
+        masked[y0:y1, x0:x1] = grid_2d[y0:y1, x0:x1]
+    return masked
+
+
 # ── Temporal smoothing (MultisiteTempArduino 2.py, lines ~410) ───────────────
 
 def temporal_smooth(series: np.ndarray, window: int = 11, poly: int = 3) -> np.ndarray:
@@ -113,9 +170,9 @@ def normalize_to_baseline(series: np.ndarray, time_s: np.ndarray,
     mask = time_s <= baseline_end_sec
     if mask.sum() == 0:
         mask = np.ones(len(series), dtype=bool)
-    baseline_mean = series[mask].mean()
-    if baseline_mean == 0:
-        return series - series[mask].mean()
+    baseline_mean = float(np.nanmean(series[mask]))
+    if baseline_mean == 0 or np.isnan(baseline_mean):
+        return series - float(np.nanmean(series))
     return (series - baseline_mean) / baseline_mean
 
 
@@ -204,8 +261,12 @@ def compute_tcore_estimate(roi_max_series: np.ndarray,
         tcore_estimated = slope * tskin_max + intercept
         return sample_times_s, tskin_max, tcore_estimated
 
+    def _block_max(block):
+        valid = block[~np.isnan(block)]
+        return float(valid.max()) if len(valid) > 0 else np.nan
+
     tskin_max = np.array([
-        roi_max_series[i * frames_per_sample:(i + 1) * frames_per_sample].max()
+        _block_max(roi_max_series[i * frames_per_sample:(i + 1) * frames_per_sample])
         for i in range(n_samples)
     ])
 
@@ -240,6 +301,10 @@ def process_frame(grid_raw: np.ndarray, settings) -> dict:
     if settings.apply_emissivity:
         grid = apply_emissivity_correction_array(grid, settings.epsilon_sensor,
                                                   settings.epsilon_mouse)
+
+    if getattr(settings, 'arena_enabled', False):
+        grid = apply_arena_mask(grid, settings.arena_x, settings.arena_y,
+                                settings.arena_w, settings.arena_h)
 
     max_row, max_col, max_temp = find_max_pixel(grid)
 

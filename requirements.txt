@@ -6,3 +6,6 @@ pandas>=2.0.0
 opencv-python-headless>=4.7.0
 statsmodels>=0.14.0
 scikit-posthocs>=0.7.0
+pyqtgraph>=0.13.0
+pyserial>=3.5
+pysenxor-lite>=0.1.0

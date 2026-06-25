@@ -1,5 +1,5 @@
 """Application-wide default constants for Glöd."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List
 
 
@@ -12,11 +12,14 @@ CAMERA_FPS: float = 10.0
 # ── ROI defaults ─────────────────────────────────────────────────────────────
 ROI_MODE_DYNAMIC: str = "dynamic"
 ROI_MODE_STATIC: str = "static"
+ROI_MODE_BLOB: str = "blob"
 ROI_DEFAULT_MODE: str = ROI_MODE_DYNAMIC
 ROI_DEFAULT_W: int = 10
 ROI_DEFAULT_H: int = 10
 ROI_DEFAULT_X: int = 35
 ROI_DEFAULT_Y: int = 26
+ROI_MIN_BLOB_PX: int = 20          # min connected-region area to count as animal
+ROI_BLOB_TEMP_THRESHOLD: float = 30.0  # °C — pixels below this are not the mouse
 
 # ── Thermal display ──────────────────────────────────────────────────────────
 T_MIN_DEFAULT: float = 22.5
@@ -35,6 +38,13 @@ TCORE_SAMPLING_INTERVAL_SEC: float = 60.0   # take max T_skin per this interval
 TCORE_AVERAGING_WINDOW_MIN: float = 30.0    # rolling average over this window
 TCORE_SLOPE: float = 0.93
 TCORE_INTERCEPT: float = 7.1               # °C
+
+# ── Arena ────────────────────────────────────────────────────────────────────
+ARENA_ENABLED: bool = False
+ARENA_X: int = 0
+ARENA_Y: int = 0
+ARENA_W: int = CAMERA_WIDTH
+ARENA_H: int = CAMERA_HEIGHT
 
 # ── Signal processing ────────────────────────────────────────────────────────
 SPATIAL_SIGMA: float = 0.5          # Gaussian spatial smoothing
@@ -60,6 +70,14 @@ VIDEO_FPS_DEFAULT: float = 10.0
 # ── Output ───────────────────────────────────────────────────────────────────
 OUTPUT_DIR_PREFIX: str = "glod_output"
 
+# ── Live capture ──────────────────────────────────────────────────────────────
+CAMERA_BASE_FPS: int = 25           # MI48x3 base frame rate (FPS = 25 / divider)
+RECORDINGS_SUBDIR: str = "recordings"
+# USB VID:PID for Waveshare / Meridian MI48x3 cameras.
+# Run find_camera_ports.py with cameras plugged in to confirm values,
+# then update this tuple and CLAUDE.md.
+KNOWN_CAMERA_VIDS: tuple = (0x0416,)   # Confirmed: VID=0x0416 PID=0xb020 (Winbond/SiGe CDC), COM6/COM7/COM14
+
 
 @dataclass
 class AnalysisSettings:
@@ -74,6 +92,8 @@ class AnalysisSettings:
     roi_y: int = ROI_DEFAULT_Y
     roi_w: int = ROI_DEFAULT_W
     roi_h: int = ROI_DEFAULT_H
+    roi_min_blob_px: int = ROI_MIN_BLOB_PX
+    roi_blob_temp_threshold: float = ROI_BLOB_TEMP_THRESHOLD
 
     colormap: str = COLORMAP_DEFAULT
     t_min: float = T_MIN_DEFAULT
@@ -92,6 +112,12 @@ class AnalysisSettings:
     baseline_end_sec: float = BASELINE_END_SEC
     spatial_sigma: float = SPATIAL_SIGMA
     savgol_window: int = SAVGOL_WINDOW
+
+    arena_enabled: bool = ARENA_ENABLED
+    arena_x: int = ARENA_X
+    arena_y: int = ARENA_Y
+    arena_w: int = ARENA_W
+    arena_h: int = ARENA_H
 
     export_video: bool = False
     output_dir: str = ""

@@ -157,10 +157,12 @@ class FolderGroupWidget(QFrame):
         return self._video_cb.isChecked()
 
     def get_txt_files(self) -> list[str]:
-        """Return sorted list of .txt files in the selected folder."""
+        """Return sorted .txt files in the selected folder and one level of subdirs."""
         if not self._folder_path:
             return []
-        return sorted(str(p) for p in Path(self._folder_path).glob("*.txt"))
+        p = Path(self._folder_path)
+        files = sorted(p.glob("*.txt")) + sorted(p.glob("*/*.txt"))
+        return [str(f) for f in files]
 
     def is_valid(self) -> bool:
         return bool(self._folder_path) and Path(self._folder_path).is_dir()

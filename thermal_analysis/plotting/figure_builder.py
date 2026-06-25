@@ -195,19 +195,25 @@ def build_max_pixel_movement(roi_df: pd.DataFrame, cam_width: int,
     cols = roi_df["max_col"].to_numpy().astype(int)
     temps = roi_df["max_temp"].to_numpy()
 
+    # In blob mode, missed frames are stored as row/col == -1 and temp == NaN.
+    # Filter them out so they don't corrupt the scatter or heatmap.
+    valid = (rows >= 0) & (cols >= 0) & np.isfinite(temps)
+    rows, cols, temps = rows[valid], cols[valid], temps[valid]
+
     # ── Trajectory scatter (coloured by temperature) ──────────────────────
-    sc = ax1.scatter(cols, rows, c=temps, cmap="inferno", s=6, alpha=0.6,
-                     vmin=temps.min(), vmax=temps.max())
-    # Draw trajectory line
-    ax1.plot(cols, rows, color="#C8D0CC", lw=0.5, alpha=0.4, zorder=0)
+    if len(rows) > 0:
+        sc = ax1.scatter(cols, rows, c=temps, cmap="inferno", s=6, alpha=0.6,
+                         vmin=temps.min(), vmax=temps.max())
+        ax1.plot(cols, rows, color="#C8D0CC", lw=0.5, alpha=0.4, zorder=0)
+        plt.colorbar(sc, ax=ax1, label="Temperature (°C)", shrink=0.85)
     ax1.invert_yaxis()
     ax1.set_xlim(0, cam_width)
     ax1.set_ylim(cam_height, 0)
-    plt.colorbar(sc, ax=ax1, label="Temperature (°C)", shrink=0.85)
 
     # ── Frequency heatmap ─────────────────────────────────────────────────
     freq = np.zeros((cam_height, cam_width), dtype=np.float32)
-    np.add.at(freq, (rows.clip(0, cam_height - 1), cols.clip(0, cam_width - 1)), 1)
+    if len(rows) > 0:
+        np.add.at(freq, (rows.clip(0, cam_height - 1), cols.clip(0, cam_width - 1)), 1)
     freq_smooth = gaussian_filter1d(gaussian_filter1d(freq, sigma=1, axis=0), sigma=1, axis=1)
     im = ax2.imshow(freq_smooth, origin="upper", cmap="hot",
                     extent=[0, cam_width, cam_height, 0], aspect="auto")

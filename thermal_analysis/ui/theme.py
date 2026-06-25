@@ -433,6 +433,58 @@ QStatusBar {{
     font-size: 12px;
     padding: 2px 8px;
 }}
+
+/* ── Record / Stop buttons (Live Capture) ───────────────── */
+QPushButton#RecordButton {{
+    background-color: {ACCENT};
+    color: #FFFFFF;
+    border: none;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 15px;
+    min-height: 46px;
+    letter-spacing: 0.5px;
+}}
+
+QPushButton#RecordButton:hover {{
+    background-color: {ACCENT_HOVER};
+}}
+
+QPushButton#RecordButton:pressed {{
+    background-color: {ACCENT_PRESSED};
+}}
+
+QPushButton#RecordButton:disabled {{
+    background-color: #ADB5BD;
+    color: #F8F9FA;
+}}
+
+QPushButton#StopRecordButton {{
+    background-color: {ERROR};
+    color: #FFFFFF;
+    border: none;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 15px;
+    min-height: 46px;
+}}
+
+QPushButton#StopRecordButton:hover {{
+    background-color: #A93226;
+}}
+
+QPushButton#StopRecordButton:disabled {{
+    background-color: #ADB5BD;
+    color: #F8F9FA;
+}}
+
+/* ── Section divider label ──────────────────────────────── */
+QLabel#DividerLabel {{
+    color: {TEXT_MUTED};
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}}
 """
 
 

@@ -35,6 +35,7 @@ from .roi_analysis import (
     find_max_pixel,
     find_roi_dynamic,
     find_roi_static,
+    find_roi_blob,
     apply_emissivity_correction_array,
     temporal_smooth,
     normalize_to_baseline,
@@ -93,7 +94,7 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
     import sys, os
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from processing.roi_analysis import (
-        find_max_pixel, find_roi_dynamic, find_roi_static,
+        find_max_pixel, find_roi_dynamic, find_roi_static, find_roi_blob,
         apply_emissivity_correction_array, temporal_smooth,
         normalize_to_baseline, compute_tcore_estimate,
     )
@@ -188,6 +189,25 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
             roi_stack = stack[:, y0:y1, x0:x1]  # (N, roi_h, roi_w)
             roi_means = roi_stack.mean(axis=(1, 2))
             roi_maxes = roi_stack.max(axis=(1, 2))
+
+        elif roi_mode == "blob":
+            # Blob tracking: find largest warm connected region per frame.
+            # Frames where no blob meets the size threshold get NaN — short
+            # gaps (≤2 frames) are later interpolated before smoothing.
+            min_blob_px = settings_dict.get("roi_min_blob_px", 20)
+            temp_threshold = settings_dict.get("roi_blob_temp_threshold", 30.0)
+            roi_means = np.full(n_frames, np.nan, dtype=np.float64)
+            roi_maxes = np.full(n_frames, np.nan, dtype=np.float64)
+            hot_rows = np.full(n_frames, -1, dtype=int)
+            hot_cols = np.full(n_frames, -1, dtype=int)
+            for i in range(n_frames):
+                blob = find_roi_blob(stack[i], min_blob_px, temp_threshold)
+                if blob is not None:
+                    roi_means[i] = blob["roi_mean"]
+                    roi_maxes[i] = blob["roi_max"]
+                    hot_rows[i] = blob["max_row"]
+                    hot_cols[i] = blob["max_col"]
+
         else:
             # Dynamic: per-frame, find hottest pixel → extract ROI around it
             flat = stack.reshape(n_frames, -1)
@@ -207,12 +227,18 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
             hot_rows = hot_rows.astype(int)
             hot_cols = hot_cols.astype(int)
 
-        # Max pixel per frame (vectorised)
-        flat_max = stack.reshape(n_frames, -1)
-        max_indices = flat_max.argmax(axis=1)
-        max_rows = (max_indices // width).astype(int)
-        max_cols = (max_indices % width).astype(int)
-        max_temps = flat_max[np.arange(n_frames), max_indices]
+        # Max pixel per frame — blob mode reuses its own per-frame results;
+        # other modes use the global argmax over the (arena-masked) stack.
+        if roi_mode == "blob":
+            max_rows = hot_rows          # -1 where no blob found
+            max_cols = hot_cols
+            max_temps = roi_maxes.copy() # NaN where no blob found
+        else:
+            flat_max = stack.reshape(n_frames, -1)
+            max_indices = flat_max.argmax(axis=1)
+            max_rows = (max_indices // width).astype(int)
+            max_cols = (max_indices % width).astype(int)
+            max_temps = flat_max[np.arange(n_frames), max_indices]
 
         # ── 8. Time axis ──────────────────────────────────────────────────
         t0 = timestamps.iloc[0]
@@ -220,7 +246,18 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
 
         # ── 9. Temporal smoothing ─────────────────────────────────────────
         sw = settings_dict["savgol_window"]
-        roi_max_smoothed = temporal_smooth(roi_maxes, window=sw)
+        # Blob mode can produce NaN for frames where no animal was detected.
+        # Linearly interpolate gaps of ≤2 consecutive missed frames before
+        # smoothing so short blink-outs don't break the Savitzky-Golay filter.
+        if roi_mode == "blob" and np.isnan(roi_maxes).any():
+            roi_maxes_for_smooth = (
+                pd.Series(roi_maxes)
+                .interpolate(method="linear", limit=2, limit_direction="both")
+                .to_numpy()
+            )
+        else:
+            roi_maxes_for_smooth = roi_maxes
+        roi_max_smoothed = temporal_smooth(roi_maxes_for_smooth, window=sw)
 
         # ── 10. Normalisation ─────────────────────────────────────────────
         baseline_end = settings_dict["baseline_end_sec"]

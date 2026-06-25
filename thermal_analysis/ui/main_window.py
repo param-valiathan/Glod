@@ -21,16 +21,19 @@ from PyQt6.QtCore import Qt, pyqtSlot
 
 from .plot_panel import PlotScrollPanel
 from .group_widget import FolderGroupWidget
+from .live_capture_tab import LiveCaptureTab
 from ..processing.workers import ParseWorker, VideoWorker, GroupData
 from ..utils.config import (
     AnalysisSettings, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS,
     METADATA_COLS, ROI_DEFAULT_W, ROI_DEFAULT_H, ROI_DEFAULT_X,
-    ROI_DEFAULT_Y, COLORMAPS, COLORMAP_DEFAULT,
+    ROI_DEFAULT_Y, ROI_MIN_BLOB_PX, ROI_BLOB_TEMP_THRESHOLD,
+    COLORMAPS, COLORMAP_DEFAULT,
     T_MIN_DEFAULT, T_MAX_DEFAULT,
     TCORE_SAMPLING_INTERVAL_SEC, TCORE_AVERAGING_WINDOW_MIN,
     TCORE_SLOPE, TCORE_INTERCEPT,
-    BASELINE_END_SEC, OUTPUT_DIR_PREFIX,
+    BASELINE_END_SEC, OUTPUT_DIR_PREFIX, RECORDINGS_SUBDIR,
 )
+from ..utils.animal_registry import AnimalRegistry
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +56,7 @@ class MainWindow(QMainWindow):
         self._all_group_data: dict = {}
         self._stats_results: dict = {}
         self._output_dir: str = str(Path.home() / "glod_output")
+        self._registry = AnimalRegistry(parent=self)
 
         self._build_ui()
         self._connect_signals()
@@ -208,16 +212,28 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(6, 4, 6, 6)
         layout.setSpacing(3)
 
-        mode_row = QHBoxLayout()
-        self._roi_dynamic = QRadioButton("Dynamic (hottest pixel)")
+        # Mode selection — three radio buttons
+        self._roi_mode_grp = QButtonGroup()
+        mode_row1 = QHBoxLayout()
+        self._roi_dynamic = QRadioButton("Dynamic (hottest px)")
         self._roi_static = QRadioButton("Fixed box")
         self._roi_dynamic.setChecked(True)
-        self._roi_mode_grp = QButtonGroup()
         self._roi_mode_grp.addButton(self._roi_dynamic)
         self._roi_mode_grp.addButton(self._roi_static)
-        mode_row.addWidget(self._roi_dynamic)
-        mode_row.addWidget(self._roi_static)
-        layout.addLayout(mode_row)
+        mode_row1.addWidget(self._roi_dynamic)
+        mode_row1.addWidget(self._roi_static)
+        layout.addLayout(mode_row1)
+
+        mode_row2 = QHBoxLayout()
+        self._roi_blob = QRadioButton("Blob (animal tracking)")
+        self._roi_blob.setToolTip(
+            "Find the largest connected warm region each frame.\n"
+            "Frames where no blob meets the minimum size are skipped\n"
+            "and short gaps (≤2 frames) are interpolated.")
+        self._roi_mode_grp.addButton(self._roi_blob)
+        mode_row2.addWidget(self._roi_blob)
+        mode_row2.addStretch()
+        layout.addLayout(mode_row2)
 
         coord_row = QHBoxLayout()
         coord_row.addWidget(QLabel("X"))
@@ -237,14 +253,84 @@ class MainWindow(QMainWindow):
         size_row.addWidget(self._roi_h)
         layout.addLayout(size_row)
 
-        # Enable/disable coordinate fields based on mode
-        self._roi_dynamic.toggled.connect(lambda checked: self._toggle_roi_coords(not checked))
-        self._toggle_roi_coords(False)  # dynamic is default
+        # Blob-specific controls (shown only when Blob mode is selected)
+        self._blob_controls = QWidget()
+        blob_layout = QHBoxLayout(self._blob_controls)
+        blob_layout.setContentsMargins(0, 0, 0, 0)
+        blob_layout.addWidget(QLabel("Min size (px)"))
+        self._blob_min_px = QSpinBox()
+        self._blob_min_px.setRange(1, 4096)
+        self._blob_min_px.setValue(ROI_MIN_BLOB_PX)
+        self._blob_min_px.setToolTip(
+            "Minimum blob area in pixels to count as the animal (default: 20).\n"
+            "Smaller blobs (e.g. urine spots) are ignored.")
+        blob_layout.addWidget(self._blob_min_px)
+        blob_layout.addWidget(QLabel("Threshold (°C)"))
+        self._blob_temp_thresh = QDoubleSpinBox()
+        self._blob_temp_thresh.setRange(-50, 200)
+        self._blob_temp_thresh.setValue(ROI_BLOB_TEMP_THRESHOLD)
+        self._blob_temp_thresh.setDecimals(1)
+        self._blob_temp_thresh.setToolTip(
+            "Pixels below this temperature are excluded from blob detection.\n"
+            "Set ~2–4 °C below expected animal surface temperature (default: 30 °C).")
+        blob_layout.addWidget(self._blob_temp_thresh)
+        layout.addWidget(self._blob_controls)
+
+        # Wire all three buttons to the same toggle method
+        for btn in (self._roi_dynamic, self._roi_static, self._roi_blob):
+            btn.toggled.connect(lambda _: self._update_roi_controls())
+        self._update_roi_controls()  # apply initial state
+
+        # ── Arena ─────────────────────────────────────────────────────────
+        arena_hdr = QHBoxLayout()
+        self._arena_cb = QCheckBox("Arena (restrict ROI to box)")
+        self._arena_cb.setChecked(False)
+        self._arena_cb.setToolTip(
+            "Mask pixels outside the arena before ROI detection.\n"
+            "Set X/Y/W/H below or drag the orange box in the live preview.")
+        self._arena_cb.toggled.connect(self._toggle_arena_coords)
+        arena_hdr.addWidget(self._arena_cb)
+        layout.addLayout(arena_hdr)
+
+        arena_coord_row = QHBoxLayout()
+        arena_coord_row.addWidget(QLabel("X"))
+        self._arena_x = QSpinBox()
+        self._arena_x.setRange(0, 4096)
+        self._arena_x.setValue(0)
+        arena_coord_row.addWidget(self._arena_x)
+        arena_coord_row.addWidget(QLabel("Y"))
+        self._arena_y = QSpinBox()
+        self._arena_y.setRange(0, 4096)
+        self._arena_y.setValue(0)
+        arena_coord_row.addWidget(self._arena_y)
+        layout.addLayout(arena_coord_row)
+
+        arena_size_row = QHBoxLayout()
+        arena_size_row.addWidget(QLabel("W"))
+        self._arena_w = QSpinBox()
+        self._arena_w.setRange(1, 4096)
+        self._arena_w.setValue(CAMERA_WIDTH)
+        arena_size_row.addWidget(self._arena_w)
+        arena_size_row.addWidget(QLabel("H"))
+        self._arena_h = QSpinBox()
+        self._arena_h.setRange(1, 4096)
+        self._arena_h.setValue(CAMERA_HEIGHT)
+        arena_size_row.addWidget(self._arena_h)
+        layout.addLayout(arena_size_row)
+
+        self._toggle_arena_coords(False)
 
         return box
 
-    def _toggle_roi_coords(self, enabled: bool):
-        for w in [self._roi_x, self._roi_y]:
+    def _update_roi_controls(self):
+        static = self._roi_static.isChecked()
+        blob = self._roi_blob.isChecked()
+        for w in (self._roi_x, self._roi_y):
+            w.setEnabled(static)
+        self._blob_controls.setVisible(blob)
+
+    def _toggle_arena_coords(self, enabled: bool):
+        for w in [self._arena_x, self._arena_y, self._arena_w, self._arena_h]:
             w.setEnabled(enabled)
 
     def _build_display_group(self) -> QGroupBox:
@@ -356,6 +442,16 @@ class MainWindow(QMainWindow):
         header_row.addWidget(add_btn)
         layout.addLayout(header_row)
 
+        load_rec_btn = QPushButton("Load from Recordings…")
+        load_rec_btn.setObjectName("SecondaryButton")
+        load_rec_btn.setFixedHeight(26)
+        load_rec_btn.setToolTip(
+            "Scan the recordings/ subfolder of the output directory and "
+            "auto-populate group cards from saved live-capture sessions."
+        )
+        load_rec_btn.clicked.connect(self._load_from_recordings_dialog)
+        layout.addWidget(load_rec_btn)
+
         self._groups_layout = QVBoxLayout()
         self._groups_layout.setSpacing(6)
         layout.addLayout(self._groups_layout)
@@ -441,8 +537,18 @@ class MainWindow(QMainWindow):
 
         outer_layout.addWidget(toolbar)
 
-        # ── Analysis Plots tab ────────────────────────────────────────────
+        # ── Live Capture tab ──────────────────────────────────────────────
         self._tabs = QTabWidget()
+        self._live_tab = LiveCaptureTab(
+            registry=self._registry,
+            output_dir=self._output_dir,
+            parent=self,
+        )
+        self._live_tab.send_to_analysis.connect(
+            lambda path: self._load_from_recordings(path, auto_run=True))
+        self._tabs.addTab(self._live_tab, "Live Capture")
+
+        # ── Analysis Plots tab ────────────────────────────────────────────
         self._plot_scroll = PlotScrollPanel()
         self._tabs.addTab(self._plot_scroll, "Analysis Plots")
 
@@ -473,6 +579,58 @@ class MainWindow(QMainWindow):
         self._group_widgets.append(gw)
         self._groups_layout.addWidget(gw)
 
+    def _load_from_recordings_dialog(self):
+        """Let the user pick a recordings/ folder, then auto-populate group cards."""
+        default = str(Path(self._output_dir) / RECORDINGS_SUBDIR)
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select recordings folder", default)
+        if folder:
+            self._load_from_recordings(folder)
+
+    def _load_from_recordings(self, recordings_path: str, auto_run: bool = False):
+        """
+        Scan recordings_path for group subdirectories and create a
+        FolderGroupWidget for each one found.  Each group dir may contain
+        animal subdirs (matched by get_txt_files's */*.txt glob).
+        """
+        base = Path(recordings_path)
+        if not base.is_dir():
+            QMessageBox.warning(
+                self, "Folder Not Found",
+                f"Recordings folder not found:\n{recordings_path}")
+            return
+
+        group_dirs = sorted(d for d in base.iterdir() if d.is_dir())
+        if not group_dirs:
+            QMessageBox.information(
+                self, "No Groups Found",
+                f"No group subdirectories found in:\n{recordings_path}")
+            return
+
+        added = 0
+        existing_names = {gw.group_name for gw in self._group_widgets}
+        for group_dir in group_dirs:
+            if group_dir.name in existing_names:
+                continue
+            gw = FolderGroupWidget(len(self._group_widgets) + 1, parent=self)
+            gw._name_edit.setText(group_dir.name)
+            gw._folder_path = str(group_dir)
+            n = len(list(group_dir.glob("*.txt")) + list(group_dir.glob("*/*.txt")))
+            gw._path_label.setText(f"📁 {group_dir.name}  ({n} .txt file(s))")
+            gw.removed.connect(self._remove_group)
+            gw.color_changed.connect(self._on_group_color_changed)
+            self._group_widgets.append(gw)
+            self._groups_layout.addWidget(gw)
+            added += 1
+
+        if added:
+            self._tabs.setCurrentWidget(self._plot_scroll)
+            self._log(f"✓ Loaded {added} group(s) from {recordings_path}")
+            if auto_run:
+                self._run_analysis()
+        else:
+            self._log("No new groups found (already loaded or folder empty).")
+
     def _remove_group(self, widget: FolderGroupWidget):
         if widget in self._group_widgets:
             name = widget.group_name
@@ -501,16 +659,23 @@ class MainWindow(QMainWindow):
     # ─────────────────────────────────────────────────────────────────────
 
     def _collect_settings(self) -> AnalysisSettings:
+        roi_mode = (
+            "blob" if self._roi_blob.isChecked()
+            else "static" if self._roi_static.isChecked()
+            else "dynamic"
+        )
         return AnalysisSettings(
             camera_width=self._cam_width.value(),
             camera_height=self._cam_height.value(),
             metadata_cols=self._meta_cols.value(),
             fps=self._cam_fps.value(),
-            roi_mode="dynamic" if self._roi_dynamic.isChecked() else "static",
+            roi_mode=roi_mode,
             roi_x=self._roi_x.value(),
             roi_y=self._roi_y.value(),
             roi_w=self._roi_w.value(),
             roi_h=self._roi_h.value(),
+            roi_min_blob_px=self._blob_min_px.value(),
+            roi_blob_temp_threshold=self._blob_temp_thresh.value(),
             colormap=self._colormap.currentText(),
             t_min=self._t_min.value(),
             t_max=self._t_max.value(),
@@ -523,6 +688,11 @@ class MainWindow(QMainWindow):
             tcore_slope=self._tc_slope.value(),
             tcore_intercept=self._tc_intercept.value(),
             baseline_end_sec=BASELINE_END_SEC,
+            arena_enabled=self._arena_cb.isChecked(),
+            arena_x=self._arena_x.value(),
+            arena_y=self._arena_y.value(),
+            arena_w=self._arena_w.value(),
+            arena_h=self._arena_h.value(),
             output_dir=self._output_dir,
         )
 
@@ -578,7 +748,7 @@ class MainWindow(QMainWindow):
         self._stats_results = stats_results
         self._restore_run_button()
         self._log("✓ Analysis complete — generating plots…")
-        self._tabs.setCurrentIndex(0)
+        self._tabs.setCurrentWidget(self._plot_scroll)
         self._generate_plots(all_group_data, stats_results)
         n_plots = len(self._plot_scroll._canvases)
         self._save_all_btn.setEnabled(True)
@@ -819,6 +989,7 @@ class MainWindow(QMainWindow):
         if folder:
             self._output_dir = folder
             self._out_dir_label.setText(folder)
+            self._live_tab.set_output_dir(folder)
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -845,6 +1016,8 @@ class MainWindow(QMainWindow):
         msg.exec()
 
     def closeEvent(self, event):
+        if self._live_tab._manager.is_running():
+            self._live_tab._manager.stop_all()
         for worker in [self._parse_worker, self._video_worker]:
             if worker and worker.isRunning():
                 worker.requestInterruption()
