@@ -33,3 +33,7 @@ desktop.ini
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Local experiments, findings and test output (not part of the app)
+docs/
+test_results/

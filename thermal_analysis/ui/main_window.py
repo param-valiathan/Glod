@@ -4,7 +4,10 @@ Glöd — Main application window.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -12,28 +15,32 @@ from typing import List, Optional
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QScrollArea, QVBoxLayout,
     QHBoxLayout, QLabel, QSpinBox, QDoubleSpinBox, QComboBox,
-    QPushButton, QProgressBar, QGroupBox, QRadioButton,
+    QPushButton, QProgressBar, QRadioButton,
     QButtonGroup, QCheckBox, QFrame, QTabWidget, QTextEdit,
-    QFileDialog, QMessageBox,
+    QFileDialog, QMessageBox, QStackedWidget,
 )
 from PyQt6.QtGui import QIcon, QFont
-from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtCore import Qt, QSettings, pyqtSlot
 
 from .plot_panel import PlotScrollPanel
 from .group_widget import FolderGroupWidget
 from .live_capture_tab import LiveCaptureTab
+from .collapsible import CollapsibleSection
 from ..processing.workers import ParseWorker, VideoWorker, GroupData
 from ..utils.config import (
     AnalysisSettings, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS,
     METADATA_COLS, ROI_DEFAULT_W, ROI_DEFAULT_H, ROI_DEFAULT_X,
-    ROI_DEFAULT_Y, ROI_MIN_BLOB_PX, ROI_BLOB_TEMP_THRESHOLD,
+    ROI_DEFAULT_Y,
     COLORMAPS, COLORMAP_DEFAULT,
     T_MIN_DEFAULT, T_MAX_DEFAULT,
     TCORE_SAMPLING_INTERVAL_SEC, TCORE_AVERAGING_WINDOW_MIN,
-    TCORE_SLOPE, TCORE_INTERCEPT,
-    BASELINE_END_SEC, OUTPUT_DIR_PREFIX, RECORDINGS_SUBDIR,
+    TCORE_SLOPE, TCORE_INTERCEPT, EPSILON_SENSOR,
+    BASELINE_END_SEC, SETTLE_S, MIN_COVERAGE, RECORDINGS_SUBDIR,
 )
 from ..utils.animal_registry import AnimalRegistry
+from ..utils import naming
+from ..utils.naming import animal_from_stem
+from ..processing.publication import write_figure_source_data
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +51,7 @@ class MainWindow(QMainWindow):
     def __init__(self, icon_path: Optional[str] = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Glöd — Thermal Imaging Analysis")
-        self.setMinimumSize(1100, 700)
+        self.setMinimumSize(1000, 640)
         self.resize(1400, 820)
 
         if icon_path and Path(icon_path).exists():
@@ -55,11 +62,51 @@ class MainWindow(QMainWindow):
         self._video_worker: Optional[VideoWorker] = None
         self._all_group_data: dict = {}
         self._stats_results: dict = {}
-        self._output_dir: str = str(Path.home() / "glod_output")
+        self._output_dir: str = self._load_project_folder()
+        self._run_dir: Optional[Path] = None   # analysis/<timestamp>/ of the current run
+        self._run_settings: Optional[AnalysisSettings] = None
         self._registry = AnimalRegistry(parent=self)
 
         self._build_ui()
         self._connect_signals()
+        self._set_phase(str(QSettings("Glod", "glod").value("phase", "record")))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Project folder (single user-chosen root for recordings + analyses)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _load_project_folder(self) -> str:
+        """Return the stored project folder, asking the user on first launch."""
+        stored = str(QSettings("Glod", "glod").value("project_folder", "") or "")
+        if stored and Path(stored).is_dir():
+            return stored
+        start = stored or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(
+            None, "Choose a project folder — recordings and results are saved here",
+            start)
+        if not folder:
+            folder = stored or str(Path.home() / "Glod")
+            Path(folder).mkdir(parents=True, exist_ok=True)
+        QSettings("Glod", "glod").setValue("project_folder", folder)
+        return folder
+
+    def _set_project_label(self, folder: str):
+        """Show the project folder, middle-elided so long paths never overflow."""
+        from PyQt6.QtCore import Qt as _Qt
+        fm = self._project_lbl.fontMetrics()
+        self._project_lbl.setText(fm.elidedText(folder, _Qt.TextElideMode.ElideMiddle, 340))
+        self._project_lbl.setToolTip(folder)
+
+    def _change_project_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose project folder", self._output_dir)
+        if not folder:
+            return
+        self._output_dir = folder
+        QSettings("Glod", "glod").setValue("project_folder", folder)
+        self._set_project_label(folder)
+        self._live_tab.set_output_dir(folder)
+        self._log(f"Project folder → {folder}")
 
     # ─────────────────────────────────────────────────────────────────────
     # UI Construction
@@ -75,20 +122,47 @@ class MainWindow(QMainWindow):
         # ── Header bar ────────────────────────────────────────────────────
         root_layout.addWidget(self._build_header())
 
-        # ── Main splitter (left control | right view) ─────────────────────
+        # ── Phase pages: Record (live capture) | Analyse ──────────────────
+        self._phase_stack = QStackedWidget()
+
+        self._live_tab = LiveCaptureTab(
+            registry=self._registry,
+            output_dir=self._output_dir,
+            parent=self,
+        )
+        self._live_tab.send_to_analysis.connect(
+            lambda path: self._load_from_recordings(path, auto_run=True))
+        self._phase_stack.addWidget(self._live_tab)          # index 0
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
-
         splitter.addWidget(self._build_control_panel())
         splitter.addWidget(self._build_view_panel())
-        splitter.setSizes([340, 1060])
+        splitter.setSizes([430, 970])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        self._phase_stack.addWidget(splitter)                # index 1
 
-        root_layout.addWidget(splitter, stretch=1)
+        root_layout.addWidget(self._phase_stack, stretch=1)
 
         # ── Status bar ────────────────────────────────────────────────────
-        self.statusBar().showMessage("Ready — add experimental groups to begin.")
+        self._open_run_btn = QPushButton("Open results folder")
+        self._open_run_btn.setObjectName("SmallButton")
+        self._open_run_btn.setVisible(False)
+        self._open_run_btn.clicked.connect(self._open_run_dir)
+        self.statusBar().addPermanentWidget(self._open_run_btn)
+        self.statusBar().showMessage("Ready.")
+
+    def _set_phase(self, phase: str):
+        analyse = phase == "analyse"
+        self._phase_stack.setCurrentIndex(1 if analyse else 0)
+        self._phase_record_btn.setChecked(not analyse)
+        self._phase_analyse_btn.setChecked(analyse)
+        QSettings("Glod", "glod").setValue("phase", "analyse" if analyse else "record")
+
+    def _open_run_dir(self):
+        if self._run_dir and self._run_dir.is_dir():
+            os.startfile(str(self._run_dir))
 
     def _build_header(self) -> QWidget:
         header = QFrame()
@@ -98,22 +172,41 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(header)
         layout.setContentsMargins(16, 0, 16, 0)
 
-        # Ember/glow icon placeholder (replaced by real icon if available)
-        icon_label = QLabel("🔥")
-        icon_label.setFont(QFont("Segoe UI Emoji", 22))
-        layout.addWidget(icon_label)
-
         title = QLabel("Glöd")
         title.setObjectName("TitleLabel")
         title.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
         layout.addWidget(title)
+        layout.addSpacing(20)
 
-        sub = QLabel("Thermal Imaging ROI Analysis")
-        sub.setObjectName("SubtitleLabel")
-        sub.setStyleSheet("color: #6C757D; font-size: 12px; margin-left: 6px;")
-        layout.addWidget(sub)
+        # Phase switch
+        self._phase_record_btn = QPushButton("Record")
+        self._phase_analyse_btn = QPushButton("Analyse")
+        for btn, phase in ((self._phase_record_btn, "record"),
+                           (self._phase_analyse_btn, "analyse")):
+            btn.setObjectName("PhaseButton")
+            btn.setCheckable(True)
+            btn.setFixedHeight(30)
+            btn.clicked.connect(lambda _=False, p=phase: self._set_phase(p))
+            layout.addWidget(btn)
 
         layout.addStretch()
+
+        # Project folder
+        folder_caption = QLabel("Project folder")
+        folder_caption.setStyleSheet("color: #6C757D; font-size: 11px;")
+        layout.addWidget(folder_caption)
+        self._project_lbl = QLabel()
+        self._project_lbl.setMaximumWidth(360)
+        self._set_project_label(self._output_dir)
+        self._project_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.NoTextInteraction)
+        layout.addWidget(self._project_lbl)
+        change_btn = QPushButton("Change…")
+        change_btn.setObjectName("SecondaryButton")
+        change_btn.setFixedHeight(30)
+        change_btn.clicked.connect(self._change_project_folder)
+        layout.addWidget(change_btn)
+        layout.addSpacing(8)
 
         # About button
         about_btn = QPushButton("About")
@@ -126,7 +219,7 @@ class MainWindow(QMainWindow):
 
     def _build_control_panel(self) -> QWidget:
         wrapper = QWidget()
-        wrapper.setMinimumWidth(260)
+        wrapper.setMinimumWidth(425)
         wrapper_layout = QVBoxLayout(wrapper)
         wrapper_layout.setContentsMargins(0, 0, 0, 0)
         wrapper_layout.setSpacing(0)
@@ -138,21 +231,57 @@ class MainWindow(QMainWindow):
 
         container = QWidget()
         container.setObjectName("ControlPanel")
-        container.setStyleSheet("background: #EEF2F0;")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        layout.addWidget(self._build_camera_group())
-        layout.addWidget(self._build_roi_group())
-        layout.addWidget(self._build_display_group())
-        layout.addWidget(self._build_tcore_group())
+        # 1. Groups — the primary input
         layout.addWidget(self._build_groups_section())
-        layout.addWidget(self._build_actions())
+
+        # 1b. Time-point comparison (collapsed; summary shows the chosen times)
+        self._sec_tp = CollapsibleSection("Time-point comparison",
+                                          settings_key="timepoints")
+        self._sec_tp.add_widget(self._build_timepoint_group())
+        layout.addWidget(self._sec_tp)
+
+        # 2. Video export (collapsed)
+        video_sec = CollapsibleSection("Video export", settings_key="video")
+        video_sec.add_widget(self._build_display_group())
+        video_sec.add_widget(self._build_video_actions())
+        layout.addWidget(video_sec)
+
+        # 3. Advanced settings (collapsed; sensible defaults)
+        adv = CollapsibleSection("Advanced settings", settings_key="advanced")
+        self._sec_roi = CollapsibleSection("ROI & arena", expanded=True,
+                                           settings_key="roi")
+        self._sec_roi.add_widget(self._build_roi_group())
+        self._sec_tcore = CollapsibleSection("T_core estimation",
+                                             settings_key="tcore")
+        self._sec_tcore.add_widget(self._build_tcore_group())
+        self._sec_emiss = CollapsibleSection("Emissivity correction",
+                                             settings_key="emissivity")
+        self._sec_emiss.add_widget(self._build_emissivity_group())
+        self._sec_fmt = CollapsibleSection("Recording file format",
+                                           settings_key="format")
+        self._sec_fmt.add_widget(self._build_camera_group())
+        for sec in (self._sec_roi, self._sec_tcore, self._sec_emiss, self._sec_fmt):
+            adv.add_widget(sec)
+        layout.addWidget(adv)
         layout.addStretch()
+
+        for w in (self._roi_body, self._roi_static,
+                  self._tcore_cb, self._emiss_cb):
+            w.toggled.connect(lambda _: self._refresh_summaries())
+        for w in (self._roi_w, self._roi_h, self._cam_width, self._cam_height,
+                  self._cam_fps):
+            w.valueChanged.connect(lambda _: self._refresh_summaries())
+        self._refresh_summaries()
 
         scroll.setWidget(container)
         wrapper_layout.addWidget(scroll, 1)
+
+        # Pinned footer: Run + progress are always visible
+        wrapper_layout.addWidget(self._build_actions())
 
         footer = QLabel("P.Valiathan 2026  ·  Karolinska Institutet")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -166,8 +295,8 @@ class MainWindow(QMainWindow):
 
     # ── Parameter group builders ──────────────────────────────────────────
 
-    def _build_camera_group(self) -> QGroupBox:
-        box = QGroupBox("Camera Settings")
+    def _build_camera_group(self) -> QWidget:
+        box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(6, 4, 6, 6)
         layout.setSpacing(3)
@@ -206,35 +335,29 @@ class MainWindow(QMainWindow):
 
         return box
 
-    def _build_roi_group(self) -> QGroupBox:
-        box = QGroupBox("ROI Settings")
+    def _build_roi_group(self) -> QWidget:
+        box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(6, 4, 6, 6)
         layout.setSpacing(3)
 
-        # Mode selection — three radio buttons
+        # Mode selection — radio buttons (Body tracking is the recommended default)
         self._roi_mode_grp = QButtonGroup()
-        mode_row1 = QHBoxLayout()
-        self._roi_dynamic = QRadioButton("Dynamic (hottest px)")
-        self._roi_static = QRadioButton("Fixed box")
-        self._roi_dynamic.setChecked(True)
-        self._roi_mode_grp.addButton(self._roi_dynamic)
+        self._roi_body = QRadioButton("Body (auto-tracking, recommended)")
+        self._roi_body.setToolTip(
+            "Segments the mouse body in every frame (adaptive threshold, tail removed)\n"
+            "and reads its temperature. Frames where the body is mostly out of view are\n"
+            "ignored instead of appearing as temperature dips. Needs no settings.")
+        self._roi_body.setChecked(True)
+        self._roi_mode_grp.addButton(self._roi_body)
+        layout.addWidget(self._roi_body)
+
+        self._roi_static = QRadioButton("Fixed box (restrained / anaesthetised animal)")
+        self._roi_static.setToolTip(
+            "Reads the temperature from a fixed rectangle (X, Y, width, height).\n"
+            "Use only when the animal does not move.")
         self._roi_mode_grp.addButton(self._roi_static)
-        mode_row1.addWidget(self._roi_dynamic)
-        mode_row1.addWidget(self._roi_static)
-        layout.addLayout(mode_row1)
-
-        mode_row2 = QHBoxLayout()
-        self._roi_blob = QRadioButton("Blob (animal tracking)")
-        self._roi_blob.setToolTip(
-            "Find the largest connected warm region each frame.\n"
-            "Frames where no blob meets the minimum size are skipped\n"
-            "and short gaps (≤2 frames) are interpolated.")
-        self._roi_mode_grp.addButton(self._roi_blob)
-        mode_row2.addWidget(self._roi_blob)
-        mode_row2.addStretch()
-        layout.addLayout(mode_row2)
-
+        layout.addWidget(self._roi_static)
         coord_row = QHBoxLayout()
         coord_row.addWidget(QLabel("X"))
         self._roi_x = QSpinBox(); self._roi_x.setRange(0, 4096); self._roi_x.setValue(ROI_DEFAULT_X)
@@ -253,33 +376,43 @@ class MainWindow(QMainWindow):
         size_row.addWidget(self._roi_h)
         layout.addLayout(size_row)
 
-        # Blob-specific controls (shown only when Blob mode is selected)
-        self._blob_controls = QWidget()
-        blob_layout = QHBoxLayout(self._blob_controls)
-        blob_layout.setContentsMargins(0, 0, 0, 0)
-        blob_layout.addWidget(QLabel("Min size (px)"))
-        self._blob_min_px = QSpinBox()
-        self._blob_min_px.setRange(1, 4096)
-        self._blob_min_px.setValue(ROI_MIN_BLOB_PX)
-        self._blob_min_px.setToolTip(
-            "Minimum blob area in pixels to count as the animal (default: 20).\n"
-            "Smaller blobs (e.g. urine spots) are ignored.")
-        blob_layout.addWidget(self._blob_min_px)
-        blob_layout.addWidget(QLabel("Threshold (°C)"))
-        self._blob_temp_thresh = QDoubleSpinBox()
-        self._blob_temp_thresh.setRange(-50, 200)
-        self._blob_temp_thresh.setValue(ROI_BLOB_TEMP_THRESHOLD)
-        self._blob_temp_thresh.setDecimals(1)
-        self._blob_temp_thresh.setToolTip(
-            "Pixels below this temperature are excluded from blob detection.\n"
-            "Set ~2–4 °C below expected animal surface temperature (default: 30 °C).")
-        blob_layout.addWidget(self._blob_temp_thresh)
-        layout.addWidget(self._blob_controls)
-
-        # Wire all three buttons to the same toggle method
-        for btn in (self._roi_dynamic, self._roi_static, self._roi_blob):
+        # Wire all mode buttons to the same toggle method
+        for btn in (self._roi_body, self._roi_static):
             btn.toggled.connect(lambda _: self._update_roi_controls())
         self._update_roi_controls()  # apply initial state
+
+        # ── Settling period ───────────────────────────────────────────────
+        settle_row = QHBoxLayout()
+        settle_row.addWidget(QLabel("Settling period"))
+        self._settle_s = QDoubleSpinBox()
+        self._settle_s.setRange(0.0, 600.0)
+        self._settle_s.setDecimals(0)
+        self._settle_s.setSingleStep(15.0)
+        self._settle_s.setValue(SETTLE_S)
+        self._settle_s.setSuffix(" s")
+        self._settle_s.setToolTip(
+            "Seconds after placing the mouse in the box that are excluded from the\n"
+            "baseline, T_core and per-animal statistics (shaded grey in plots).\n"
+            "On the reference recordings the body signal ran 0.3–0.5 °C low for the\n"
+            "first ~45–90 s (handling/transfer). 0 = use everything.")
+        settle_row.addWidget(self._settle_s)
+        settle_row.addStretch()
+        layout.addLayout(settle_row)
+
+        cov_row = QHBoxLayout()
+        cov_row.addWidget(QLabel("Min. body tracked"))
+        self._min_cov = QDoubleSpinBox()
+        self._min_cov.setRange(0.0, 100.0)
+        self._min_cov.setDecimals(0)
+        self._min_cov.setValue(MIN_COVERAGE * 100)
+        self._min_cov.setSuffix(" %")
+        self._min_cov.setToolTip(
+            "Recordings in which the body was tracked in fewer frames than this (after the\n"
+            "settling period) are left out of group statistics and listed as EXCLUDED in the\n"
+            "tracking-QC table. Untracked frames are never filled in.")
+        cov_row.addWidget(self._min_cov)
+        cov_row.addStretch()
+        layout.addLayout(cov_row)
 
         # ── Arena ─────────────────────────────────────────────────────────
         arena_hdr = QHBoxLayout()
@@ -292,6 +425,11 @@ class MainWindow(QMainWindow):
         arena_hdr.addWidget(self._arena_cb)
         layout.addLayout(arena_hdr)
 
+        self._arena_box = QWidget()
+        arena_box_layout = QVBoxLayout(self._arena_box)
+        arena_box_layout.setContentsMargins(0, 0, 0, 0)
+        arena_box_layout.setSpacing(3)
+
         arena_coord_row = QHBoxLayout()
         arena_coord_row.addWidget(QLabel("X"))
         self._arena_x = QSpinBox()
@@ -303,7 +441,7 @@ class MainWindow(QMainWindow):
         self._arena_y.setRange(0, 4096)
         self._arena_y.setValue(0)
         arena_coord_row.addWidget(self._arena_y)
-        layout.addLayout(arena_coord_row)
+        arena_box_layout.addLayout(arena_coord_row)
 
         arena_size_row = QHBoxLayout()
         arena_size_row.addWidget(QLabel("W"))
@@ -316,7 +454,8 @@ class MainWindow(QMainWindow):
         self._arena_h.setRange(1, 4096)
         self._arena_h.setValue(CAMERA_HEIGHT)
         arena_size_row.addWidget(self._arena_h)
-        layout.addLayout(arena_size_row)
+        arena_box_layout.addLayout(arena_size_row)
+        layout.addWidget(self._arena_box)
 
         self._toggle_arena_coords(False)
 
@@ -324,17 +463,16 @@ class MainWindow(QMainWindow):
 
     def _update_roi_controls(self):
         static = self._roi_static.isChecked()
-        blob = self._roi_blob.isChecked()
-        for w in (self._roi_x, self._roi_y):
+        for w in (self._roi_x, self._roi_y, self._roi_w, self._roi_h):
             w.setEnabled(static)
-        self._blob_controls.setVisible(blob)
 
     def _toggle_arena_coords(self, enabled: bool):
         for w in [self._arena_x, self._arena_y, self._arena_w, self._arena_h]:
             w.setEnabled(enabled)
+        self._arena_box.setVisible(enabled)
 
-    def _build_display_group(self) -> QGroupBox:
-        box = QGroupBox("Display Settings")
+    def _build_display_group(self) -> QWidget:
+        box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(6, 4, 6, 6)
         layout.setSpacing(3)
@@ -358,27 +496,122 @@ class MainWindow(QMainWindow):
         range_row.addWidget(self._t_max)
         layout.addLayout(range_row)
 
-        emiss_row = QHBoxLayout()
-        self._emiss_cb = QCheckBox("Emissivity correction")
-        self._emiss_cb.setChecked(False)
-        emiss_row.addWidget(self._emiss_cb)
-        layout.addLayout(emiss_row)
-
-        emiss_vals = QHBoxLayout()
-        emiss_vals.addWidget(QLabel("ε mouse"))
-        self._eps_mouse = QDoubleSpinBox()
-        self._eps_mouse.setRange(0.01, 1.0); self._eps_mouse.setValue(0.93); self._eps_mouse.setDecimals(2)
-        emiss_vals.addWidget(self._eps_mouse)
-        emiss_vals.addWidget(QLabel("ε sensor"))
-        self._eps_sensor = QDoubleSpinBox()
-        self._eps_sensor.setRange(0.01, 1.0); self._eps_sensor.setValue(1.0); self._eps_sensor.setDecimals(2)
-        emiss_vals.addWidget(self._eps_sensor)
-        layout.addLayout(emiss_vals)
-
         return box
 
-    def _build_tcore_group(self) -> QGroupBox:
-        box = QGroupBox("T_core Estimation")
+    def _build_timepoint_group(self) -> QWidget:
+        """Up to three user-set times (minutes from recording start)."""
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+
+        hint = QLabel("Compare temperature between groups at up to 3 times "
+                      "after the start of each recording.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6C757D; font-size: 11px;")
+        layout.addWidget(hint)
+
+        self._tp_checks: list = []
+        self._tp_spins: list = []
+        for i, default in enumerate((5.0, 15.0, 30.0)):
+            row = QHBoxLayout()
+            cb = QCheckBox(f"Time point {i + 1}")
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1440.0)
+            sp.setDecimals(1)
+            sp.setValue(default)
+            sp.setSuffix(" min")
+            sp.setEnabled(False)
+            cb.toggled.connect(sp.setEnabled)
+            cb.toggled.connect(lambda _: self._refresh_summaries())
+            sp.valueChanged.connect(lambda _: self._refresh_summaries())
+            row.addWidget(cb)
+            row.addStretch()
+            row.addWidget(sp)
+            layout.addLayout(row)
+            self._tp_checks.append(cb)
+            self._tp_spins.append(sp)
+
+        sig_row = QHBoxLayout()
+        sig_row.addWidget(QLabel("Signal"))
+        self._tp_signal = QComboBox()
+        self._tp_signal.addItem("ROI max temperature (°C)", "roi_max")
+        self._tp_signal.addItem("Baseline-normalised ROI max (Δ°C)", "normalized_roi_max")
+        self._tp_signal.addItem("Estimated T_core (°C)", "tcore_estimated")
+        sig_row.addWidget(self._tp_signal, stretch=1)
+        layout.addLayout(sig_row)
+
+        win_row = QHBoxLayout()
+        win_row.addWidget(QLabel("Averaging window"))
+        self._tp_window = QDoubleSpinBox()
+        self._tp_window.setRange(1.0, 600.0)
+        self._tp_window.setDecimals(0)
+        self._tp_window.setValue(30.0)
+        self._tp_window.setSuffix(" s")
+        self._tp_window.setToolTip(
+            "Mean over this window centred on each time point. "
+            "Recordings that end before a time point are excluded from it.")
+        win_row.addWidget(self._tp_window)
+        layout.addLayout(win_row)
+        return box
+
+    def _timepoints_s(self) -> list:
+        vals = {round(sp.value() * 60.0, 3)
+                for cb, sp in zip(self._tp_checks, self._tp_spins) if cb.isChecked()}
+        return sorted(vals)
+
+    def _refresh_summaries(self):
+        """One-line state shown on collapsed section headers."""
+        tps = self._timepoints_s()
+        self._sec_tp.set_summary(
+            ", ".join(f"{t / 60:g} min" for t in tps) if tps else "off")
+        self._sec_roi.set_summary(
+            "Body tracking" if self._roi_body.isChecked()
+            else f"Fixed box · {self._roi_w.value()}×{self._roi_h.value()}")
+        self._sec_tcore.set_summary("on" if self._tcore_cb.isChecked() else "off")
+        self._sec_emiss.set_summary("on" if self._emiss_cb.isChecked() else "off")
+        self._sec_fmt.set_summary(
+            f"{self._cam_width.value()}×{self._cam_height.value()} @ "
+            f"{self._cam_fps.value():g} fps")
+
+    def _build_emissivity_group(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+
+        self._emiss_cb = QCheckBox("Correct for coat emissivity")
+        self._emiss_cb.setChecked(True)
+        self._emiss_cb.setToolTip(
+            "Choose the animal / coat on each group card (default C57BL/6).\n"
+            "Applied to the temperature readings only; estimated T_core always uses the\n"
+            "uncorrected sensor values its regression was calibrated on.")
+        layout.addWidget(self._emiss_cb)
+
+        sens_row = QHBoxLayout()
+        sens_row.addWidget(QLabel("Camera setting ε"))
+        self._eps_sensor = QDoubleSpinBox()
+        self._eps_sensor.setRange(0.50, 1.0)
+        self._eps_sensor.setDecimals(2)
+        self._eps_sensor.setSingleStep(0.01)
+        self._eps_sensor.setValue(EPSILON_SENSOR)
+        self._eps_sensor.setToolTip(
+            "Emissivity the camera itself assumed when it converted radiance to °C.\n"
+            "The MI48x3 EMISSIVITY register reads 95 % on all three cameras\n"
+            "(factory default; Glöd never changes it). Change only if you set it differently.")
+        sens_row.addWidget(self._eps_sensor)
+        sens_row.addStretch()
+        layout.addLayout(sens_row)
+        note = QLabel("Animal / coat is chosen on each group card. Fur ε in the literature "
+                      "spans 0.86–0.98; a wrong value shifts all readings by a nearly constant "
+                      "offset, so it matters for absolute temperatures, not for within-animal changes.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #6C757D; font-size: 10px;")
+        layout.addWidget(note)
+
+        return box
+    def _build_tcore_group(self) -> QWidget:
+        box = QWidget()
         box.setToolTip("van der Vinne et al. (2020) Sci Rep 10:20680")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(6, 4, 6, 6)
@@ -452,6 +685,30 @@ class MainWindow(QMainWindow):
         load_rec_btn.clicked.connect(self._load_from_recordings_dialog)
         layout.addWidget(load_rec_btn)
 
+        # Paired design: same animals measured in several groups (e.g. ±drug)
+        self._paired_cb = QCheckBox("Paired design (same animals in groups)")
+        self._paired_cb.setToolTip(
+            "Tick when the same mice were recorded under different conditions\n"
+            "(e.g. with and without drug). Animals are matched by name across groups\n"
+            "and compared with paired statistics. Auto-ticked when the same animal\n"
+            "names are found in more than one group.")
+        self._paired_cb.clicked.connect(self._on_paired_clicked)
+        pair_row = QHBoxLayout()
+        pair_row.addWidget(self._paired_cb, stretch=1)
+        help_btn = QPushButton("?")
+        help_btn.setObjectName("SmallButton")
+        help_btn.setFixedSize(24, 24)
+        help_btn.setToolTip("How to set up experiments that reuse animals")
+        help_btn.clicked.connect(self._show_pairing_help)
+        pair_row.addWidget(help_btn)
+        layout.addLayout(pair_row)
+        self._pair_status = QLabel("")
+        self._pair_status.setWordWrap(True)
+        self._pair_status.setStyleSheet("color: #6C757D; font-size: 11px;")
+        self._pair_status.setVisible(False)
+        layout.addWidget(self._pair_status)
+        self._pair_user_set = False   # True once the user toggled the box themselves
+
         self._groups_layout = QVBoxLayout()
         self._groups_layout.setSpacing(6)
         layout.addLayout(self._groups_layout)
@@ -459,106 +716,60 @@ class MainWindow(QMainWindow):
         return container
 
     def _build_actions(self) -> QWidget:
+        """Pinned footer: Run button + progress (always visible)."""
         container = QWidget()
+        container.setObjectName("ActionsBar")
+        container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        btn_row = QHBoxLayout()
         self._run_btn = QPushButton("Run Analysis")
         self._run_btn.setObjectName("RunButton")
-        self._run_btn.setFixedHeight(36)
+        self._run_btn.setFixedHeight(40)
         self._run_btn.clicked.connect(self._run_analysis)
-        btn_row.addWidget(self._run_btn)
+        layout.addWidget(self._run_btn)
 
-        self._video_btn = QPushButton("Export Video")
-        self._video_btn.setFixedHeight(36)
-        self._video_btn.setObjectName("SecondaryButton")
-        self._video_btn.clicked.connect(self._export_video_prompt)
-        btn_row.addWidget(self._video_btn)
-        layout.addLayout(btn_row)
-
-        # Output dir row
-        out_row = QHBoxLayout()
-        out_row.addWidget(QLabel("Output dir:"))
-        self._out_dir_label = QLabel(self._output_dir)
-        self._out_dir_label.setStyleSheet("font-size: 11px; color: #6C757D;")
-        self._out_dir_label.setWordWrap(True)
-        out_row.addWidget(self._out_dir_label, stretch=1)
-        browse_out_btn = QPushButton("…")
-        browse_out_btn.setObjectName("SmallButton")
-        browse_out_btn.setFixedSize(28, 26)
-        browse_out_btn.clicked.connect(self._browse_output_dir)
-        out_row.addWidget(browse_out_btn)
-        layout.addLayout(out_row)
-
-        # Progress bars
-        parse_row = QHBoxLayout()
-        parse_row.addWidget(QLabel("Parsing:"))
         self._parse_progress = QProgressBar()
         self._parse_progress.setValue(0)
         self._parse_progress.setTextVisible(True)
-        parse_row.addWidget(self._parse_progress)
-        layout.addLayout(parse_row)
+        layout.addWidget(self._parse_progress)
 
-        video_row = QHBoxLayout()
-        video_row.addWidget(QLabel("Video:  "))
+        return container
+
+    def _build_video_actions(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(4)
+
+        self._video_btn = QPushButton("Export Video")
+        self._video_btn.setObjectName("SecondaryButton")
+        self._video_btn.setFixedHeight(30)
+        self._video_btn.setToolTip(
+            "Saved automatically to the results folder of the last analysis.")
+        self._video_btn.clicked.connect(self._export_video_prompt)
+        layout.addWidget(self._video_btn)
+
         self._video_progress = QProgressBar()
         self._video_progress.setValue(0)
         self._video_progress.setTextVisible(True)
-        video_row.addWidget(self._video_progress)
-        layout.addLayout(video_row)
+        layout.addWidget(self._video_progress)
 
         return container
 
     def _build_view_panel(self) -> QWidget:
-        outer = QWidget()
-        outer_layout = QVBoxLayout(outer)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        outer_layout.setSpacing(0)
-
-        # ── Toolbar row above tabs (Save All button lives here) ────────────
-        toolbar = QFrame()
-        toolbar.setFixedHeight(38)
-        toolbar.setStyleSheet(
-            "QFrame { background: #EEF2F0; border-bottom: 1px solid #DEE2E6; }")
-        tb_layout = QHBoxLayout(toolbar)
-        tb_layout.setContentsMargins(8, 0, 8, 0)
-        tb_layout.addStretch()
-
-        self._save_all_btn = QPushButton("💾  Save All")
-        self._save_all_btn.setObjectName("SecondaryButton")
-        self._save_all_btn.setFixedHeight(28)
-        self._save_all_btn.setEnabled(False)
-        self._save_all_btn.setToolTip(
-            "Save all plots as PNG images and CSV data to a chosen folder")
-        self._save_all_btn.clicked.connect(self._save_all)
-        tb_layout.addWidget(self._save_all_btn)
-
-        outer_layout.addWidget(toolbar)
-
-        # ── Live Capture tab ──────────────────────────────────────────────
+        """Results area: plots (category tabs) and the console log."""
         self._tabs = QTabWidget()
-        self._live_tab = LiveCaptureTab(
-            registry=self._registry,
-            output_dir=self._output_dir,
-            parent=self,
-        )
-        self._live_tab.send_to_analysis.connect(
-            lambda path: self._load_from_recordings(path, auto_run=True))
-        self._tabs.addTab(self._live_tab, "Live Capture")
 
-        # ── Analysis Plots tab ────────────────────────────────────────────
         self._plot_scroll = PlotScrollPanel()
-        self._tabs.addTab(self._plot_scroll, "Analysis Plots")
+        self._tabs.addTab(self._plot_scroll, "Results")
 
-        # ── Console Log tab ───────────────────────────────────────────────
         self._log_edit = QTextEdit()
         self._log_edit.setReadOnly(True)
-        self._tabs.addTab(self._log_edit, "Console Log")
+        self._tabs.addTab(self._log_edit, "Log")
 
-        outer_layout.addWidget(self._tabs, stretch=1)
-        return outer
+        return self._tabs
 
     # ─────────────────────────────────────────────────────────────────────
     # Signal connections
@@ -576,16 +787,20 @@ class MainWindow(QMainWindow):
         gw = FolderGroupWidget(idx)
         gw.removed.connect(self._remove_group)
         gw.color_changed.connect(self._on_group_color_changed)
+        gw.changed.connect(self._refresh_pairing)
         self._group_widgets.append(gw)
         self._groups_layout.addWidget(gw)
+        self._refresh_pairing()
 
     def _load_from_recordings_dialog(self):
         """Let the user pick a recordings/ folder, then auto-populate group cards."""
         default = str(Path(self._output_dir) / RECORDINGS_SUBDIR)
         folder = QFileDialog.getExistingDirectory(
-            self, "Select recordings folder", default)
+            self, "Select a recordings folder or a Glöd project folder", default)
         if folder:
-            self._load_from_recordings(folder)
+            # A whole project folder is accepted: use its recordings/ subfolder.
+            sub = Path(folder) / RECORDINGS_SUBDIR
+            self._load_from_recordings(str(sub if sub.is_dir() else folder))
 
     def _load_from_recordings(self, recordings_path: str, auto_run: bool = False):
         """
@@ -615,21 +830,95 @@ class MainWindow(QMainWindow):
             gw = FolderGroupWidget(len(self._group_widgets) + 1, parent=self)
             gw._name_edit.setText(group_dir.name)
             gw._folder_path = str(group_dir)
-            n = len(list(group_dir.glob("*.txt")) + list(group_dir.glob("*/*.txt")))
-            gw._path_label.setText(f"📁 {group_dir.name}  ({n} .txt file(s))")
+            gw._path_label.setText(FolderGroupWidget.describe_folder(str(group_dir)))
             gw.removed.connect(self._remove_group)
             gw.color_changed.connect(self._on_group_color_changed)
+            gw.changed.connect(self._refresh_pairing)
             self._group_widgets.append(gw)
             self._groups_layout.addWidget(gw)
             added += 1
 
         if added:
+            self._refresh_pairing()
+            self._set_phase("analyse")
             self._tabs.setCurrentWidget(self._plot_scroll)
             self._log(f"✓ Loaded {added} group(s) from {recordings_path}")
             if auto_run:
                 self._run_analysis()
         else:
             self._log("No new groups found (already loaded or folder empty).")
+
+    def _animals_by_group(self) -> dict:
+        """{group name: {animal key: display name}} from the recordings on disk."""
+        out: dict = {}
+        for gw in self._group_widgets:
+            if not gw.is_valid():
+                continue
+            animals = out.setdefault(gw.group_name, {})
+            for f in gw.get_txt_files():
+                a = naming.animal_from_stem(Path(f).stem)
+                animals.setdefault(naming.safe(a).lower(), a)
+        return out
+
+    def _show_pairing_help(self):
+        QMessageBox.information(
+            self, "Reusing animals across conditions",
+            "<b>Same mouse, different conditions (e.g. with / without drug)</b>"
+            "<ol>"
+            "<li><b>One group per condition</b> - e.g. <i>Vehicle</i> and <i>Drug</i>.</li>"
+            "<li><b>Same animal name</b> for the same mouse in every group "
+            "(e.g. <i>M1</i> in both). Names are matched ignoring upper/lower case.</li>"
+            "<li>Record each condition on its own day or session - groups from "
+            "different sessions are found automatically.</li>"
+            "<li>In Analyse, Glöd ticks <i>paired design</i> for you and lists "
+            "which animals matched.</li>"
+            "</ol>"
+            "Animals missing from a group are left out of the paired tests.<br>"
+            "Different mice in each group? Use different names - nothing else to do.")
+
+    def _on_paired_clicked(self, checked: bool):
+        self._pair_user_set = True
+        self._refresh_pairing()
+
+    def _refresh_pairing(self):
+        """Detect animals shared between groups; auto-tick and explain the pairing."""
+        by_group = self._animals_by_group()
+        names = list(by_group)
+        if len(names) < 2:
+            self._pair_status.setVisible(False)
+            if not self._pair_user_set:
+                self._paired_cb.setChecked(False)
+            return
+        all_keys = set().union(*[set(v) for v in by_group.values()])
+        shared = set.intersection(*[set(v) for v in by_group.values()])
+        in_several = {k for k in all_keys if sum(k in v for v in by_group.values()) > 1}
+        if in_several and not self._pair_user_set:
+            self._paired_cb.setChecked(True)
+
+        if not self._paired_cb.isChecked():
+            if in_several:
+                self._pair_status.setText(
+                    f"{len(in_several)} animal name(s) appear in more than one group — "
+                    "tick the box above to compare them as paired.")
+                self._pair_status.setVisible(True)
+            else:
+                self._pair_status.setVisible(False)
+            return
+
+        display = {}
+        for v in by_group.values():
+            display.update(v)
+        lines = [f"✓ {len(shared)} animal(s) found in all {len(names)} groups "
+                 "will be compared as paired."]
+        if len(shared) < 2:
+            lines = ["⚠ Fewer than 2 animals appear in every group — paired statistics "
+                     "need matching animal names across groups."]
+        loose = sorted(display[k] for k in all_keys - shared)
+        if loose:
+            shown = ", ".join(loose[:6]) + (" …" if len(loose) > 6 else "")
+            lines.append(f"Not in every group (excluded from paired tests): {shown}.")
+        self._pair_status.setText("\n".join(lines))
+        self._pair_status.setVisible(True)
 
     def _remove_group(self, widget: FolderGroupWidget):
         if widget in self._group_widgets:
@@ -638,6 +927,7 @@ class MainWindow(QMainWindow):
             self._groups_layout.removeWidget(widget)
             widget.setParent(None)
             widget.deleteLater()
+            self._refresh_pairing()
             if name in self._all_group_data:
                 del self._all_group_data[name]
                 self._replot_from_existing()
@@ -659,11 +949,7 @@ class MainWindow(QMainWindow):
     # ─────────────────────────────────────────────────────────────────────
 
     def _collect_settings(self) -> AnalysisSettings:
-        roi_mode = (
-            "blob" if self._roi_blob.isChecked()
-            else "static" if self._roi_static.isChecked()
-            else "dynamic"
-        )
+        roi_mode = "static" if self._roi_static.isChecked() else "body"
         return AnalysisSettings(
             camera_width=self._cam_width.value(),
             camera_height=self._cam_height.value(),
@@ -674,13 +960,10 @@ class MainWindow(QMainWindow):
             roi_y=self._roi_y.value(),
             roi_w=self._roi_w.value(),
             roi_h=self._roi_h.value(),
-            roi_min_blob_px=self._blob_min_px.value(),
-            roi_blob_temp_threshold=self._blob_temp_thresh.value(),
             colormap=self._colormap.currentText(),
             t_min=self._t_min.value(),
             t_max=self._t_max.value(),
             apply_emissivity=self._emiss_cb.isChecked(),
-            epsilon_mouse=self._eps_mouse.value(),
             epsilon_sensor=self._eps_sensor.value(),
             tcore_enabled=self._tcore_cb.isChecked(),
             tcore_sampling_interval_sec=self._tc_sample.value(),
@@ -688,6 +971,12 @@ class MainWindow(QMainWindow):
             tcore_slope=self._tc_slope.value(),
             tcore_intercept=self._tc_intercept.value(),
             baseline_end_sec=BASELINE_END_SEC,
+            settle_s=self._settle_s.value(),
+            min_coverage=self._min_cov.value() / 100.0,
+            paired_design=self._paired_cb.isChecked(),
+            timepoints_s=self._timepoints_s(),
+            timepoint_signal=self._tp_signal.currentData(),
+            timepoint_window_s=self._tp_window.value(),
             arena_enabled=self._arena_cb.isChecked(),
             arena_x=self._arena_x.value(),
             arena_y=self._arena_y.value(),
@@ -708,6 +997,24 @@ class MainWindow(QMainWindow):
             return
 
         settings = self._collect_settings()
+        if settings.timepoint_signal == "tcore_estimated" and settings.timepoints_s \
+                and not settings.tcore_enabled:
+            QMessageBox.warning(self, "T_core disabled",
+                                "Time-point signal is Estimated T_core, but T_core "
+                                "estimation is off (Advanced settings → T_core).")
+            return
+        if settings.paired_design:
+            by_group = self._animals_by_group()
+            shared = (set.intersection(*[set(v) for v in by_group.values()])
+                      if len(by_group) >= 2 else set())
+            if len(shared) < 2:
+                QMessageBox.warning(
+                    self, "Paired design",
+                    "Paired design is ticked, but fewer than 2 animals have the same "
+                    "name in every group.\n\nUse identical animal names for the same "
+                    "mouse in each group, or untick the paired option.")
+                return
+        self._run_settings = settings
         self._parse_progress.setValue(0)
         self._plot_scroll.clear()
         self._log_edit.clear()
@@ -721,20 +1028,28 @@ class MainWindow(QMainWindow):
                 continue
             self._log(f"  {gw.group_name}: {len(files)} file(s) found")
             gdata = GroupData(gw.group_name, gw.color, files)
+            gdata.epsilon = gw.emissivity
+            gdata.coat_label = gw.coat_label
             groups.append(gdata)
 
         if not groups:
             QMessageBox.warning(self, "No Data", "No .txt files found in any folder.")
             return
 
-        self._parse_worker = ParseWorker(groups, settings, self._output_dir)
+        # One timestamped folder per run: <project>/analysis/<ts>/
+        self._run_dir = (Path(self._output_dir) / "analysis"
+                         / datetime.now().strftime("%Y-%m-%d_%H%M%S"))
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+        self._open_run_btn.setVisible(False)
+        self._write_settings_json(settings, groups)
+
+        self._parse_worker = ParseWorker(groups, settings, str(self._run_dir))
         self._parse_worker.progress.connect(self._parse_progress.setValue)
         self._parse_worker.log_message.connect(self._log)
         self._parse_worker.finished.connect(self._on_analysis_done)
         self._parse_worker.error.connect(self._on_worker_error)
         self._run_btn.setEnabled(False)
         self._run_btn.setText("Running…")
-        self._save_all_btn.setEnabled(False)
         self.statusBar().showMessage("Analysis running — please wait…")
         self._parse_worker.start()
 
@@ -751,14 +1066,17 @@ class MainWindow(QMainWindow):
         self._tabs.setCurrentWidget(self._plot_scroll)
         self._generate_plots(all_group_data, stats_results)
         n_plots = len(self._plot_scroll._canvases)
-        self._save_all_btn.setEnabled(True)
+        saved = self._autosave_results()
         self.statusBar().showMessage(
-            f"Analysis complete — {n_plots} plot(s) generated.")
+            f"Analysis complete — {n_plots} plot(s) saved to {self._run_dir}"
+            if saved else f"Analysis complete — {n_plots} plot(s); see Log for save errors.")
+        self._open_run_btn.setVisible(True)
 
         # Auto-trigger video export for groups that requested it
-        for gw in self._group_widgets:
-            if gw.export_video and gw.is_valid():
-                self._export_video_for_group(gw)
+        wanted = [gw.group_name for gw in self._group_widgets
+                  if gw.export_video and gw.is_valid()]
+        if wanted:
+            self._export_videos(wanted)
 
     @pyqtSlot(str)
     def _on_worker_error(self, msg: str):
@@ -773,66 +1091,61 @@ class MainWindow(QMainWindow):
 
     def _generate_plots(self, all_group_data: dict, stats_results: dict):
         from ..plotting.figure_builder import (
-            build_normalized_roi, build_rate_of_change, build_roi_max_vs_mean,
-            build_max_pixel_temperature, build_max_pixel_movement,
-            build_absolute_comparison, build_tcore_estimated,
-            build_tcore_rate_of_change, build_group_comparison_bars,
-            build_group_violin_box,
+            build_timecourse, build_tcore_estimated, build_animal_overview,
+            build_tracking_qc, build_group_comparison_bars, build_timepoint_bars,
         )
 
         self._plot_scroll.clear()
         n_groups = len(all_group_data)
+        rs = getattr(self, "_run_settings", None) or self._collect_settings()
 
         try:
-            # ── Multi-group time-series plots ─────────────────────────────
+            # ── Group time courses (every animal + group mean) ────────────
             self._plot_scroll.add_figure(
-                build_normalized_roi(all_group_data), "Normalised ROI")
+                build_timecourse(all_group_data, "delta"), "Temperature change", "Overview")
             self._plot_scroll.add_figure(
-                build_rate_of_change(all_group_data), "Rate of Change (ROI)")
-            self._plot_scroll.add_figure(
-                build_absolute_comparison(all_group_data), "Absolute ROI")
+                build_timecourse(all_group_data, "abs"), "Absolute temperature", "Overview")
 
             if any(gd.tcore_mean is not None for gd in all_group_data.values()):
                 self._plot_scroll.add_figure(
-                    build_tcore_estimated(all_group_data), "Estimated T_core")
-                self._plot_scroll.add_figure(
-                    build_tcore_rate_of_change(all_group_data), "T_core Rate of Change")
+                    build_tcore_estimated(all_group_data), "Estimated T_core", "T_core")
 
-            # ── Per-file plots (first 6 camera files to avoid overload) ───
-            shown = 0
+            # ── Tracking quality across all animals ───────────────────────
+            qc_df = stats_results.get("qc_df")
+            if qc_df is not None and len(qc_df):
+                self._plot_scroll.add_figure(
+                    build_tracking_qc(all_group_data, qc_df, rs.min_coverage),
+                    "Tracking quality", "Quality")
+
+            # ── One overview per recording ────────────────────────────────
             for g_name, gd in all_group_data.items():
                 for stem, roi_df in gd.roi_dfs.items():
-                    if shown >= 6:
-                        break
-                    if len(roi_df) > 0:
-                        self._plot_scroll.add_figure(
-                            build_roi_max_vs_mean(roi_df, f"{g_name} — {stem}"),
-                            f"ROI Max/Mean: {stem}")
-                        self._plot_scroll.add_figure(
-                            build_max_pixel_temperature(roi_df, f"{g_name} — {stem}"),
-                            f"Max Pixel: {stem}")
-                        w = self._cam_width.value()
-                        h = self._cam_height.value()
-                        self._plot_scroll.add_figure(
-                            build_max_pixel_movement(roi_df, w, h, f"{g_name} — {stem}"),
-                            f"Trajectory: {stem}")
-                    shown += 1
+                    if len(roi_df) == 0:
+                        continue
+                    self._plot_scroll.add_figure(
+                        build_animal_overview(
+                            roi_df, f"{g_name} — {animal_from_stem(stem)}",
+                            self._cam_width.value(), self._cam_height.value(),
+                            gd.per_file_metrics.get(stem)),
+                        f"Animal {g_name} {animal_from_stem(stem)}", "Per animal")
+
+            # ── Time-point comparison (when time points were set) ─────────
+            if rs.timepoints_s and stats_results.get("timepoint_df") is not None:
+                self._plot_scroll.add_figure(
+                    build_timepoint_bars(all_group_data, stats_results, rs),
+                    "Time-point comparison", "Time points")
 
             # ── Group comparison (only with 2+ groups) ────────────────────
             if n_groups >= 2 and stats_results.get("per_file_df") is not None:
                 self._plot_scroll.add_figure(
                     build_group_comparison_bars(all_group_data, stats_results),
-                    "Group Comparison Bars")
-                self._plot_scroll.add_figure(
-                    build_group_violin_box(all_group_data, stats_results),
-                    "Group Violin / Box")
+                    "Group Comparison Bars", "Statistics")
 
             self._log(f"✓ {len(self._plot_scroll._canvases)} plots generated.")
 
         except Exception as exc:
             self._log(f"⚠ Plot generation error: {exc}")
             log.exception("Plot generation error", exc_info=exc)
-
     # ─────────────────────────────────────────────────────────────────────
     # Video export
     # ─────────────────────────────────────────────────────────────────────
@@ -842,55 +1155,66 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Data",
                                     "Run analysis first before exporting video.")
             return
+        self._export_videos(list(self._all_group_data.keys()))
 
-        group_names = list(self._all_group_data.keys())
-        # If only one group, use it directly
-        if len(group_names) == 1:
-            self._export_video_for_name(group_names[0])
-        else:
-            from PyQt6.QtWidgets import QInputDialog
-            chosen, ok = QInputDialog.getItem(
-                self, "Select Group", "Export video for group:", group_names, 0, False)
-            if ok:
-                self._export_video_for_name(chosen)
+    def _video_jobs(self, group_name: str) -> list:
+        """One group-tile job plus one job per animal for ``group_name``.
 
-    def _export_video_for_name(self, group_name: str):
+        Names: <date>_<group>_tile.mp4 and <date>_<group>_<animal>.mp4,
+        all inside <run folder>/videos/<group>/.
+        """
+        from ..utils import naming
         gd = self._all_group_data.get(group_name)
-        if gd is None:
-            return
-        # Prefer the full paths stored in GroupData; fall back to group widget
-        file_paths = gd.file_paths
+        file_paths = list(gd.file_paths) if gd is not None else []
         if not file_paths:
-            gw = next((w for w in self._group_widgets if w.group_name == group_name), None)
+            gw = next((w for w in self._group_widgets
+                       if w.group_name == group_name), None)
             file_paths = gw.get_txt_files() if gw else []
         if not file_paths:
-            QMessageBox.warning(self, "No Files", f"No .txt files found for {group_name}")
-            return
+            return []
 
-        out_path = str(Path(self._output_dir) /
-                       f"{OUTPUT_DIR_PREFIX}_{group_name}_roi_video.mp4")
-        settings = self._collect_settings()
-        self._start_video_export(file_paths, out_path, settings)
+        run_date = naming.today()
+        base = self._run_dir or (Path(self._output_dir) / "analysis")
+        vdir = base / "videos" / naming.safe(group_name)
+        vdir.mkdir(parents=True, exist_ok=True)
 
-    def _export_video_for_group(self, gw: FolderGroupWidget):
-        file_paths = gw.get_txt_files()
-        if not file_paths:
-            return
-        out_path = str(Path(self._output_dir) /
-                       f"{OUTPUT_DIR_PREFIX}_{gw.group_name}_roi_video.mp4")
-        settings = self._collect_settings()
-        self._start_video_export(file_paths, out_path, settings)
+        animals = [naming.animal_from_stem(Path(f).stem) for f in file_paths]
+        dates = [naming.date_from_stem(Path(f).stem, run_date) for f in file_paths]
+        jobs = []
+        if len(file_paths) > 1:
+            jobs.append({
+                "file_paths": file_paths, "labels": animals,
+                "group": group_name, "date": dates[0],
+                "output_path": str(vdir / naming.build(
+                    "tile", "mp4", date=dates[0], group=group_name)),
+            })
+        for fp, animal, date in zip(file_paths, animals, dates):
+            jobs.append({
+                "file_paths": [fp], "labels": [animal],
+                "group": group_name, "date": date,
+                "output_path": str(vdir / naming.build(
+                    "roi_video", "mp4", date=date, group=group_name, animal=animal)),
+            })
+        return jobs
 
-    def _start_video_export(self, file_paths, out_path, settings):
+    def _export_videos(self, group_names: list):
         if self._video_worker and self._video_worker.isRunning():
             self._log("Video export already running.")
             return
+        jobs = []
+        for name in group_names:
+            group_jobs = self._video_jobs(name)
+            if not group_jobs:
+                self._log(f"⚠ {name}: no .txt files — no video exported.")
+            jobs += group_jobs
+        if not jobs:
+            return
         self._video_progress.setValue(0)
-        self._video_worker = VideoWorker(file_paths, out_path, settings)
+        self._video_worker = VideoWorker(jobs, self._collect_settings())
         self._video_worker.progress.connect(self._video_progress.setValue)
         self._video_worker.log_message.connect(self._log)
         self._video_worker.finished.connect(
-            lambda p: self._log(f"✓ Video saved: {p}"))
+            lambda p: self._log(f"✓ Videos saved → {p}"))
         self._video_worker.error.connect(
             lambda e: self._log(f"✗ Video error: {e}"))
         self._video_worker.start()
@@ -899,97 +1223,63 @@ class MainWindow(QMainWindow):
     # Helpers
     # ─────────────────────────────────────────────────────────────────────
 
-    def _save_all(self):
-        """Save every displayed plot as a PNG and export CSV data to a chosen folder."""
-        if not self._all_group_data:
-            QMessageBox.information(self, "Nothing to Save",
-                                    "Run analysis first.")
-            return
+    def _write_settings_json(self, settings: AnalysisSettings, groups: list):
+        """Record exactly what was run, next to the results."""
+        try:
+            payload = {
+                "started": datetime.now().isoformat(timespec="seconds"),
+                "settings": dataclasses.asdict(settings),
+                "groups": {g.name: [str(f) for f in g.file_paths] for g in groups},
+                "emissivity_by_group": {g.name: {"coat": g.coat_label, "epsilon": g.epsilon}
+                                        for g in groups},
+            }
+            (self._run_dir / "settings.json").write_text(
+                json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self._log(f"⚠ Could not write settings.json: {exc}")
 
-        folder = QFileDialog.getExistingDirectory(
-            self, "Choose folder to save plots and CSV files", self._output_dir)
-        if not folder:
-            return
+    def _autosave_results(self) -> bool:
+        """Save every plot as PNG and the log into the current run folder.
 
-        import pandas as pd
-        from pathlib import Path
+        CSV data is already written by ParseWorker into <run>/data/.
+        Returns True when nothing failed.
+        """
+        if self._run_dir is None:
+            return False
+        plots_dir = self._run_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        src_dir = self._run_dir / "source_data"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        ok = True
 
-        save_dir = Path(folder)
-        errors: list[str] = []
-
-        # ── Save each plot as PNG ─────────────────────────────────────────
         for i, (fig, title) in enumerate(self._plot_scroll.figures()):
-            safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in title)
-            png_path = save_dir / f"{i + 1:02d}_{safe or 'plot'}.png"
+            fname = naming.build(f"{i + 1:02d}_{title or 'plot'}", "png",
+                                 date=self._run_dir.name[:10])
             try:
-                fig.savefig(str(png_path), dpi=150, bbox_inches="tight",
+                fig.savefig(str(plots_dir / fname),
+                            dpi=150, bbox_inches="tight",
                             facecolor=fig.get_facecolor())
             except Exception as exc:
-                errors.append(f"PNG '{title}': {exc}")
-
-        # ── Save per-file ROI CSVs and group aggregates ───────────────────
-        for g_name, gd in self._all_group_data.items():
-            safe_g = "".join(c if c.isalnum() or c in " _-" else "_" for c in g_name)
-
-            for stem, roi_df in gd.roi_dfs.items():
-                safe_s = "".join(c if c.isalnum() or c in " _-" else "_" for c in stem)
-                try:
-                    roi_df.to_csv(str(save_dir / f"{safe_g}_{safe_s}_roi.csv"), index=False)
-                except Exception as exc:
-                    errors.append(f"ROI CSV '{stem}': {exc}")
-
-            for stem, tcore_df in gd.tcore_dfs.items():
-                if tcore_df is None:
-                    continue
-                safe_s = "".join(c if c.isalnum() or c in " _-" else "_" for c in stem)
-                try:
-                    tcore_df.to_csv(
-                        str(save_dir / f"{safe_g}_{safe_s}_tcore.csv"), index=False)
-                except Exception as exc:
-                    errors.append(f"T_core CSV '{stem}': {exc}")
-
-            if gd.common_t is not None and gd.roi_mean is not None:
-                try:
-                    agg: dict = {
-                        "time_s": gd.common_t,
-                        "roi_mean": gd.roi_mean,
-                        "roi_sem": gd.roi_sem if gd.roi_sem is not None
-                                   else [None] * len(gd.common_t),
-                    }
-                    if gd.tcore_mean is not None:
-                        agg["tcore_mean"] = gd.tcore_mean
-                        agg["tcore_sem"] = (gd.tcore_sem if gd.tcore_sem is not None
-                                            else [None] * len(gd.common_t))
-                    pd.DataFrame(agg).to_csv(
-                        str(save_dir / f"{safe_g}_group_agg.csv"), index=False)
-                except Exception as exc:
-                    errors.append(f"Agg CSV '{g_name}': {exc}")
-
-        # ── Save stats per-file table ─────────────────────────────────────
-        per_file_df = self._stats_results.get("per_file_df")
-        if per_file_df is not None and not per_file_df.empty:
+                ok = False
+                self._log(f"⚠ Could not save plot '{title}': {exc}")
+            # Source data for the figure, same stem as the PNG
             try:
-                per_file_df.to_csv(str(save_dir / "stats_per_file.csv"), index=False)
+                write_figure_source_data(
+                    fig, title, src_dir / (Path(fname).stem + ".csv"),
+                    self._stats_results.get("per_file_df"),
+                    self._stats_results.get("timepoint_df"))
             except Exception as exc:
-                errors.append(f"Stats CSV: {exc}")
+                ok = False
+                self._log(f"⚠ Could not save source data for '{title}': {exc}")
 
-        n_plots = len(self._plot_scroll.figures())
-        if errors:
-            QMessageBox.warning(
-                self, "Save Completed With Warnings",
-                f"Saved with {len(errors)} error(s):\n" + "\n".join(errors[:6]))
-        else:
-            self._log(f"✓ Saved {n_plots} plot(s) and CSV data → {folder}")
-            QMessageBox.information(self, "Saved",
-                                    f"All files saved to:\n{folder}")
-
-    def _browse_output_dir(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select Output Directory", self._output_dir)
-        if folder:
-            self._output_dir = folder
-            self._out_dir_label.setText(folder)
-            self._live_tab.set_output_dir(folder)
+        self._log(f"✓ Results saved → {self._run_dir}")
+        try:
+            (self._run_dir / "log.txt").write_text(
+                self._log_edit.toPlainText(), encoding="utf-8")
+        except Exception as exc:
+            ok = False
+            self._log(f"⚠ Could not write log.txt: {exc}")
+        return ok
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")

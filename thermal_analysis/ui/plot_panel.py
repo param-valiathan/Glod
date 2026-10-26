@@ -7,7 +7,7 @@ from __future__ import annotations
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QScrollArea, QSizePolicy
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QScrollArea, QSizePolicy, QTabWidget
 from PyQt6.QtCore import Qt
 
 
@@ -65,42 +65,64 @@ class PlotCanvas(QWidget):
         return self._title
 
 
-class PlotScrollPanel(QScrollArea):
-    """
-    Scrollable panel of stacked PlotCanvas widgets.
-    Each plot is properly sized; the panel scrolls vertically.
-    """
+
+
+class _CategoryPage(QScrollArea):
+    """One scrollable column of PlotCanvas widgets."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-
-        self._container = QWidget()
-        self._layout = QVBoxLayout(self._container)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        container = QWidget()
+        self._layout = QVBoxLayout(container)
         self._layout.setContentsMargins(8, 8, 8, 8)
         self._layout.setSpacing(4)
         self._layout.addStretch(1)
-        self.setWidget(self._container)
+        self.setWidget(container)
 
+    def add_canvas(self, canvas: PlotCanvas) -> None:
+        self._layout.insertWidget(self._layout.count() - 1, canvas)
+
+
+class PlotScrollPanel(QTabWidget):
+    """
+    Plots grouped into category tabs (Overview, Per-file, T_core, Statistics).
+    API: add_figure(fig, title, category), figures(), clear().
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pages: dict[str, _CategoryPage] = {}
         self._canvases: list[PlotCanvas] = []
 
-    def add_figure(self, fig: Figure, title: str = "") -> None:
-        """Append a new figure at the bottom of the panel."""
+    def add_figure(self, fig: Figure, title: str = "",
+                   category: str = "Overview") -> None:
+        """Append a new figure to the given category tab (created on demand)."""
+        page = self._pages.get(category)
+        if page is None:
+            page = _CategoryPage()
+            self._pages[category] = page
+            self.addTab(page, category)
         canvas = PlotCanvas(fig, title)
-        # Insert before the trailing stretch
-        self._layout.insertWidget(self._layout.count() - 1, canvas)
+        page.add_canvas(canvas)
         self._canvases.append(canvas)
 
     def figures(self) -> list[tuple[Figure, str]]:
-        """Return all (figure, title) pairs — used by Save All."""
+        """Return all (figure, title) pairs."""
         return [(c.figure, c.title) for c in self._canvases]
 
     def clear(self) -> None:
-        """Remove all figures."""
+        """Remove all figures and category tabs."""
+        super().clear()
+        import matplotlib.pyplot as plt
         for canvas in self._canvases:
-            self._layout.removeWidget(canvas)
-            canvas.setParent(None)
-            canvas.deleteLater()
+            try:
+                plt.close(canvas.figure)
+            except Exception:
+                pass
+        for page in self._pages.values():
+            page.deleteLater()
+        self._pages.clear()
         self._canvases.clear()

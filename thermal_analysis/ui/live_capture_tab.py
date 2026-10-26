@@ -26,6 +26,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QColor
 
 from .camera_panel import CameraPanel
+from .collapsible import CollapsibleSection
+from ..utils.naming import safe as safe_name
 from ..capture.camera_discovery import list_cameras, list_all_serial_ports, probe
 from ..capture.capture_worker import CaptureWorker, ram_warning
 from ..capture.recording_manager import RecordingManager
@@ -98,14 +100,13 @@ class LiveCaptureTab(QWidget):
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self._build_control_strip())
         splitter.addWidget(self._build_camera_area())
-        splitter.setSizes([280, 900])
+        splitter.setSizes([310, 900])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter)
 
     def _build_control_strip(self) -> QWidget:
         panel = QFrame()
-        panel.setFixedWidth(280)
         panel.setObjectName("ControlPanel")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -158,6 +159,18 @@ class LiveCaptureTab(QWidget):
         self._record_btn.clicked.connect(self._start_recording)
         layout.addWidget(self._record_btn)
 
+        self._pause_btn = QPushButton("⏸   Pause")
+        self._pause_btn.setObjectName("PauseRecordButton")
+        self._pause_btn.setProperty("paused", False)
+        self._pause_btn.setToolTip(
+            "Pause keeps the cameras streaming (live view stays on) but records nothing.\n"
+            "Resume continues the same files. In the analysis the pause is cut out of the\n"
+            "time axis, so the recording simply continues as if nothing happened. Only\n"
+            "recorded time counts towards the chosen duration.")
+        self._pause_btn.setVisible(False)
+        self._pause_btn.clicked.connect(self._toggle_pause)
+        layout.addWidget(self._pause_btn)
+
         self._stop_btn = QPushButton("⏹   Stop Recording")
         self._stop_btn.setObjectName("StopRecordButton")
         self._stop_btn.setVisible(False)
@@ -169,7 +182,7 @@ class LiveCaptureTab(QWidget):
         self._status_lbl.setStyleSheet("font-size: 11px; color: #6C757D; padding: 2px 0;")
         layout.addWidget(self._status_lbl)
 
-        self._send_btn = QPushButton("→  Send to Analysis")
+        self._send_btn = QPushButton("Analyse recordings  →")
         self._send_btn.setObjectName("SecondaryButton")
         self._send_btn.setEnabled(False)
         self._send_btn.clicked.connect(self._send_to_analysis)
@@ -177,18 +190,24 @@ class LiveCaptureTab(QWidget):
 
         layout.addStretch()
 
-        # ── Camera log ─────────────────────────────────────────────────────
-        log_lbl = QLabel("CAMERA LOG")
-        log_lbl.setObjectName("DividerLabel")
-        layout.addWidget(log_lbl)
-
+        # ── Camera log (collapsed by default) ──────────────────────────────
+        log_sec = CollapsibleSection("Camera log", expanded=False,
+                                     settings_key="camera_log")
         self._inline_log = QTextEdit()
         self._inline_log.setReadOnly(True)
         self._inline_log.setFixedHeight(100)
         self._inline_log.setToolTip("Camera connection and error log")
-        layout.addWidget(self._inline_log)
+        log_sec.add_widget(self._inline_log)
+        layout.addWidget(log_sec)
 
-        return panel
+        # Scrollable so nothing overlaps when the window is short
+        scroll = QScrollArea()
+        scroll.setFixedWidth(310)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(panel)
+        return scroll
 
     def _build_settings_group(self) -> QWidget:
         w = QWidget()
@@ -203,12 +222,12 @@ class LiveCaptureTab(QWidget):
         self._fps_spin = QSpinBox()
         self._fps_spin.setRange(1, 25)
         self._fps_spin.setValue(5)
-        self._fps_spin.setFixedWidth(64)
+        self._fps_spin.setFixedWidth(84)
         self._fps_spin.setToolTip(
             "Target FPS per camera. Keep ≤5 on a USB hub to avoid\n"
             "bus contention. Each camera staggers its start by 0.3 s.")
         fps_row.addWidget(self._fps_spin)
-        fps_row.addWidget(QLabel("(≤5 on USB hub)"))
+        fps_row.addWidget(QLabel("(≤5 on hub)"))
         fps_row.addStretch()
         layout.addLayout(fps_row)
 
@@ -219,23 +238,10 @@ class LiveCaptureTab(QWidget):
         self._dur_spin = QSpinBox()
         self._dur_spin.setRange(10, 7200)
         self._dur_spin.setValue(300)
-        self._dur_spin.setFixedWidth(64)
+        self._dur_spin.setFixedWidth(92)
         dur_row.addWidget(self._dur_spin)
         dur_row.addStretch()
         layout.addLayout(dur_row)
-
-        out_row = QHBoxLayout()
-        out_row.addWidget(QLabel("Output:"))
-        self._out_lbl = QLabel(self._output_dir or "(not set)")
-        self._out_lbl.setStyleSheet("font-size: 10px; color: #6C757D;")
-        self._out_lbl.setWordWrap(True)
-        out_row.addWidget(self._out_lbl, stretch=1)
-        browse_btn = QPushButton("…")
-        browse_btn.setObjectName("SmallButton")
-        browse_btn.setFixedSize(26, 24)
-        browse_btn.clicked.connect(self._browse_output)
-        out_row.addWidget(browse_btn)
-        layout.addLayout(out_row)
 
         return w
 
@@ -263,6 +269,12 @@ class LiveCaptureTab(QWidget):
         btn_row.addWidget(rm_btn)
         layout.addLayout(btn_row)
 
+        hint = QLabel("Re-testing a mouse (e.g. ± drug)? Make one group per "
+                      "condition and give the mouse the <b>same name</b> in each.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6C757D; font-size: 11px;")
+        layout.addWidget(hint)
+
         return w
 
     def _build_camera_area(self) -> QWidget:
@@ -271,6 +283,7 @@ class LiveCaptureTab(QWidget):
         outer_layout.setContentsMargins(0, 0, 0, 0)
 
         scroll = QScrollArea()
+        self._camera_scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
@@ -376,9 +389,7 @@ class LiveCaptureTab(QWidget):
         elif not self._panels and self._no_cam_lbl is not None:
             self._no_cam_lbl.setVisible(True)
 
-        for i, (cam_id, panel) in enumerate(self._panels.items()):
-            row, col = divmod(i, 2)
-            self._grid_layout.addWidget(panel, row, col)
+        self._relayout_grid()
 
         self._preview_btn.setEnabled(bool(self._panels))
 
@@ -386,6 +397,23 @@ class LiveCaptureTab(QWidget):
         for cam in cameras:
             if cam["source"] != "auto":
                 self._probe_async(cam["id"])
+
+    def _grid_cols(self) -> int:
+        """Camera cards per row: as many as fit (each card needs ~400 px)."""
+        return max(1, self._camera_scroll.viewport().width() // 400)
+
+    def _relayout_grid(self):
+        cols = self._grid_cols()
+        for i, panel in enumerate(self._panels.values()):
+            self._grid_layout.removeWidget(panel)
+            row, col = divmod(i, cols)
+            self._grid_layout.addWidget(panel, row, col)
+        self._last_cols = cols
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._panels and self._grid_cols() != getattr(self, "_last_cols", None):
+            self._relayout_grid()
 
     # ── Live preview (no recording) ────────────────────────────────────────
 
@@ -471,13 +499,28 @@ class LiveCaptureTab(QWidget):
             self._log("Stopping preview before recording…")
             self._stop_preview()
 
-        configs = []
-        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        for i, (cam_id, panel) in enumerate(self._panels.items()):
+        # Animal names are mandatory and unique: they name every output file
+        # and label the videos.
+        names = {}
+        for cam_id, panel in self._panels.items():
             name = panel._animal_edit.text().strip()
             if not name or name == cam_id:
-                name = f"{_ts}_{i + 1:02d}"
-                panel._animal_edit.setText(name)
+                QMessageBox.warning(
+                    self, "Animal name required",
+                    f"Enter an animal name for camera {cam_id} before recording.")
+                return
+            key = safe_name(name).lower()
+            if key in names:
+                QMessageBox.warning(
+                    self, "Duplicate animal name",
+                    f"'{name}' is used by both {names[key]} and {cam_id}. "
+                    "Animal names must be unique.")
+                return
+            names[key] = cam_id
+
+        configs = []
+        for i, (cam_id, panel) in enumerate(self._panels.items()):
+            name = panel._animal_edit.text().strip()
             if not panel.group_name:
                 QMessageBox.warning(
                     self, "Missing Group",
@@ -528,16 +571,38 @@ class LiveCaptureTab(QWidget):
 
         self._record_btn.setVisible(False)
         self._stop_btn.setVisible(True)
+        self._set_paused_ui(False)
+        self._pause_btn.setVisible(True)
         self._preview_btn.setEnabled(False)
         self._elapsed_s = 0
         self._elapsed_timer.start()
         self._send_btn.setEnabled(False)
+
+    def _toggle_pause(self):
+        """Pause / resume recording on all cameras (live view keeps running)."""
+        if self._manager.is_paused():
+            self._manager.resume_all()
+            self._set_paused_ui(False)
+            self._elapsed_timer.start()
+        else:
+            self._manager.pause_all()
+            self._set_paused_ui(True)
+            self._elapsed_timer.stop()
+            m, s = divmod(self._elapsed_s, 60)
+            self._status_lbl.setText(f"Paused at {m}:{s:02d} — not recording")
+
+    def _set_paused_ui(self, paused: bool):
+        self._pause_btn.setText("▶   Resume" if paused else "⏸   Pause")
+        self._pause_btn.setProperty("paused", paused)
+        self._pause_btn.style().unpolish(self._pause_btn)
+        self._pause_btn.style().polish(self._pause_btn)
 
     def _stop_recording(self):
         self._manager.stop_all()
         self._elapsed_timer.stop()
         self._status_lbl.setText("Stopping…")
         self._stop_btn.setEnabled(False)
+        self._pause_btn.setEnabled(False)
 
     @pyqtSlot(list)
     def _on_all_saved(self, paths: list):
@@ -545,6 +610,9 @@ class LiveCaptureTab(QWidget):
         self._record_btn.setVisible(True)
         self._stop_btn.setVisible(False)
         self._stop_btn.setEnabled(True)
+        self._pause_btn.setVisible(False)
+        self._pause_btn.setEnabled(True)
+        self._set_paused_ui(False)
         self._preview_btn.setEnabled(bool(self._panels))
         for panel in self._panels.values():
             panel.set_status(False)
@@ -597,13 +665,6 @@ class LiveCaptureTab(QWidget):
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
-    def _browse_output(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select Output Directory", self._output_dir or "")
-        if folder:
-            self._output_dir = folder
-            self._out_lbl.setText(folder)
-
     def _send_to_analysis(self):
         recordings_path = str(Path(self._output_dir) / RECORDINGS_SUBDIR)
         self.send_to_analysis.emit(recordings_path)
@@ -639,7 +700,6 @@ class LiveCaptureTab(QWidget):
 
     def set_output_dir(self, path: str):
         self._output_dir = path
-        self._out_lbl.setText(path or "(not set)")
 
 
 # ── Manual port selection dialog ───────────────────────────────────────────────

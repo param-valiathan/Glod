@@ -1,5 +1,5 @@
 """Application-wide default constants for Glöd."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 
@@ -10,16 +10,13 @@ METADATA_COLS: int = 8          # columns before pixel data in each line
 CAMERA_FPS: float = 10.0
 
 # ── ROI defaults ─────────────────────────────────────────────────────────────
-ROI_MODE_DYNAMIC: str = "dynamic"
-ROI_MODE_STATIC: str = "static"
-ROI_MODE_BLOB: str = "blob"
-ROI_DEFAULT_MODE: str = ROI_MODE_DYNAMIC
+ROI_MODE_STATIC: str = "static"   # fixed box, for restrained / anaesthetised animals
+ROI_MODE_BODY: str = "body"        # adaptive body segmentation (processing/mouse_tracker.py)
+ROI_DEFAULT_MODE: str = ROI_MODE_BODY
 ROI_DEFAULT_W: int = 10
 ROI_DEFAULT_H: int = 10
 ROI_DEFAULT_X: int = 35
 ROI_DEFAULT_Y: int = 26
-ROI_MIN_BLOB_PX: int = 20          # min connected-region area to count as animal
-ROI_BLOB_TEMP_THRESHOLD: float = 30.0  # °C — pixels below this are not the mouse
 
 # ── Thermal display ──────────────────────────────────────────────────────────
 T_MIN_DEFAULT: float = 22.5
@@ -28,9 +25,9 @@ COLORMAP_DEFAULT: str = "inferno"
 COLORMAPS: List[str] = ["inferno", "plasma", "viridis", "magma", "hot", "jet"]
 
 # ── Emissivity correction ────────────────────────────────────────────────────
-APPLY_EMISSIVITY: bool = False
-EPSILON_MOUSE: float = 0.93
-EPSILON_SENSOR: float = 1.00
+APPLY_EMISSIVITY: bool = True        # applied to the temperature series (segmentation uses raw data)
+EPSILON_MOUSE: float = 0.95          # C57BL/6 preset (see utils/coat_presets.py)
+EPSILON_SENSOR: float = 0.95         # MI48 EMISSIVITY register as read from the cameras
 
 # ── T_core estimation (van der Vinne et al., 2020) ───────────────────────────
 TCORE_ENABLED: bool = True
@@ -55,6 +52,13 @@ GAUSSIAN_SIGMA_GROUP: float = 3.0   # group-level Gaussian polish
 
 # ── Analysis ─────────────────────────────────────────────────────────────────
 BASELINE_END_SEC: float = 300.0     # first N seconds used as baseline
+# Seconds after placing the mouse in the box that are excluded from baseline,
+# T_core and per-animal metrics.  On the reference 10-min recordings of 3 untreated
+# mice the body signal ran 0.3–0.5 °C low for the first ~45–90 s (handling/transfer).
+SETTLE_S: float = 90.0
+# Recordings whose body was tracked in less than this fraction of post-settle frames are
+# excluded from group statistics (still listed in the tracking-QC table).
+MIN_COVERAGE: float = 0.5
 POLY_DEGREE: int = 5
 DOWN_SAMPLE_PERIOD_SEC: float = 30.0  # interpolation step for group aggregation
 
@@ -92,8 +96,6 @@ class AnalysisSettings:
     roi_y: int = ROI_DEFAULT_Y
     roi_w: int = ROI_DEFAULT_W
     roi_h: int = ROI_DEFAULT_H
-    roi_min_blob_px: int = ROI_MIN_BLOB_PX
-    roi_blob_temp_threshold: float = ROI_BLOB_TEMP_THRESHOLD
 
     colormap: str = COLORMAP_DEFAULT
     t_min: float = T_MIN_DEFAULT
@@ -102,6 +104,8 @@ class AnalysisSettings:
     apply_emissivity: bool = APPLY_EMISSIVITY
     epsilon_mouse: float = EPSILON_MOUSE
     epsilon_sensor: float = EPSILON_SENSOR
+    coat_label: str = "Mouse · C57BL/6 (black)"
+    reflected_temp_c: float | None = None   # None → estimated from the image background
 
     tcore_enabled: bool = TCORE_ENABLED
     tcore_sampling_interval_sec: float = TCORE_SAMPLING_INTERVAL_SEC
@@ -110,8 +114,18 @@ class AnalysisSettings:
     tcore_intercept: float = TCORE_INTERCEPT
 
     baseline_end_sec: float = BASELINE_END_SEC
+    settle_s: float = SETTLE_S
+    min_coverage: float = MIN_COVERAGE
     spatial_sigma: float = SPATIAL_SIGMA
     savgol_window: int = SAVGOL_WINDOW
+
+    # Same animals measured in several groups/conditions → paired statistics
+    paired_design: bool = False
+
+    # Time-point comparison: up to 3 times (s from recording start); empty = off
+    timepoints_s: list = field(default_factory=list)
+    timepoint_signal: str = "roi_max"      # roi_max | normalized_roi_max | tcore_estimated
+    timepoint_window_s: float = 30.0       # mean over [t - w/2, t + w/2]
 
     arena_enabled: bool = ARENA_ENABLED
     arena_x: int = ARENA_X

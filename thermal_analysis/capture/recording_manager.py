@@ -206,6 +206,20 @@ class RecordingManager(QObject):
         for w in self._workers.values():
             w.stop()
 
+    def pause_all(self) -> None:
+        """Pause recording on every camera (streams stay live; nothing is kept)."""
+        for w in self._workers.values():
+            w.pause()
+        self.log_message.emit("Recording paused.")
+
+    def resume_all(self) -> None:
+        for w in self._workers.values():
+            w.resume()
+        self.log_message.emit("Recording resumed.")
+
+    def is_paused(self) -> bool:
+        return any(w.is_paused for w in self._workers.values())
+
     def is_running(self) -> bool:
         return any(w.isRunning() for w in self._workers.values())
 
@@ -260,5 +274,4 @@ class RecordingManager(QObject):
         self._save_worker.start()
 
 
-def _safe(name: str) -> str:
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name).strip("_") or "unnamed"
+from ..utils.naming import safe as _safe  # noqa: E402  (shared naming rules)

@@ -141,7 +141,7 @@ class CameraPanel(QFrame):
         name_lbl.setStyleSheet("font-size: 11px; color: #6C757D;")
         row2.addWidget(name_lbl)
         self._animal_edit = QLineEdit()
-        self._animal_edit.setPlaceholderText("Mouse_01  (auto if blank)")
+        self._animal_edit.setPlaceholderText("Animal name (required, unique)")
         self._animal_edit.editingFinished.connect(self._emit_assignment)
         row2.addWidget(self._animal_edit, stretch=1)
         root.addLayout(row2)
@@ -238,7 +238,7 @@ class CameraPanel(QFrame):
 
         self._roi_mode = QComboBox()
         self._roi_mode.addItems(["Dynamic", "Fixed"])
-        self._roi_mode.setMinimumWidth(85)
+        self._roi_mode.setMinimumWidth(100)
         self._roi_mode.setToolTip(
             "Dynamic: ROI follows the hottest pixel each frame.\n"
             "Fixed: drag the green box to set position.")
@@ -415,11 +415,12 @@ class CameraPanel(QFrame):
 
     def on_frame(self, frame: np.ndarray, elapsed_s: float,
                  apply_emissivity: bool = False,
-                 epsilon_mouse: float = 0.93,
-                 epsilon_sensor: float = 1.0) -> None:
+                 epsilon_mouse: float = 0.95,
+                 epsilon_sensor: float = 0.95) -> None:
         if apply_emissivity:
-            from ..processing.roi_analysis import apply_emissivity_correction_array
-            frame = apply_emissivity_correction_array(frame, epsilon_mouse, epsilon_sensor)
+            from ..processing.roi_analysis import correct_emissivity
+            frame = correct_emissivity(frame, epsilon_mouse, epsilon_sensor,
+                                       float(np.percentile(frame, 10)))
 
         roi_max, roi_mean = self._compute_roi_stats(frame)
         self._plot_buf.append((elapsed_s, roi_max, roi_mean))

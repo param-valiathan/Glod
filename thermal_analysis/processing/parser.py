@@ -32,12 +32,7 @@ import pandas as pd
 from scipy.ndimage import gaussian_filter
 
 from .roi_analysis import (
-    find_max_pixel,
-    find_roi_dynamic,
-    find_roi_static,
-    find_roi_blob,
-    apply_emissivity_correction_array,
-    temporal_smooth,
+    temporal_smooth, correct_emissivity,
     normalize_to_baseline,
     compute_tcore_estimate,
 )
@@ -94,10 +89,11 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
     import sys, os
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from processing.roi_analysis import (
-        find_max_pixel, find_roi_dynamic, find_roi_static, find_roi_blob,
-        apply_emissivity_correction_array, temporal_smooth,
+        temporal_smooth, correct_emissivity,
         normalize_to_baseline, compute_tcore_estimate,
     )
+    from processing.mouse_tracker import (track_body, bridge_gaps, estimate_fps,
+                                          compute_activity, find_pauses, collapse_pauses)
 
     try:
         meta_cols = settings_dict["metadata_cols"]
@@ -147,16 +143,6 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
         stack = pixels.reshape(n_frames, height, width).astype(np.float64)
         del pixels   # float32 source no longer needed
 
-        # ── 5. Optional emissivity correction — all in-place ──────────────
-        if settings_dict["apply_emissivity"]:
-            eps_s = settings_dict["epsilon_sensor"]
-            eps_m = settings_dict["epsilon_mouse"]
-            stack += 273.15                       # °C → K
-            np.power(stack, 4, out=stack)         # T_K^4
-            stack *= eps_s / eps_m                # emissivity scale
-            np.power(stack, 0.25, out=stack)      # back to T_K
-            stack -= 273.15                       # K → °C
-
         # ── 6. Spatial smoothing over entire 3D stack ──────────────────────
         sigma = settings_dict["spatial_sigma"]
         if sigma > 0:
@@ -174,6 +160,20 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
             except Exception:
                 stack = gaussian_filter(stack, sigma=(0, sigma, sigma))
 
+        # ── 6b. Time axis and *measured* frame rate ───────────────────────
+        # Every temporal window below is defined in seconds and converted with
+        # the real rate (the rig delivers ~6 Hz, not the nominal 10 Hz).
+        t0 = timestamps.iloc[0]
+        time_s = (timestamps - t0).dt.total_seconds().to_numpy()
+        # A recorder pause is cut out of the time axis: the recording simply continues from
+        # where it stopped.  Raw timestamps stay in the file; ``gap_before_s`` keeps the record.
+        pauses = find_pauses(time_s)
+        time_s, gap_before = collapse_pauses(time_s)
+        fps_nominal = float(settings_dict["fps"])
+        fps = estimate_fps(time_s, default=fps_nominal)
+        settle_s = float(settings_dict.get("settle_s", 0.0))
+        body_info = None
+
         # ── 7. ROI and max-pixel extraction ───────────────────────────────
         roi_mode = settings_dict["roi_mode"]
         roi_x = settings_dict["roi_x"]
@@ -182,6 +182,7 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
         roi_h = settings_dict["roi_h"]
 
         if roi_mode == "static":
+            # Fixed box — for restrained / anaesthetised animals that do not move
             y0 = max(0, roi_y)
             y1 = min(height, y0 + roi_h)
             x0 = max(0, roi_x)
@@ -189,90 +190,92 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
             roi_stack = stack[:, y0:y1, x0:x1]  # (N, roi_h, roi_w)
             roi_means = roi_stack.mean(axis=(1, 2))
             roi_maxes = roi_stack.max(axis=(1, 2))
-
-        elif roi_mode == "blob":
-            # Blob tracking: find largest warm connected region per frame.
-            # Frames where no blob meets the size threshold get NaN — short
-            # gaps (≤2 frames) are later interpolated before smoothing.
-            min_blob_px = settings_dict.get("roi_min_blob_px", 20)
-            temp_threshold = settings_dict.get("roi_blob_temp_threshold", 30.0)
-            roi_means = np.full(n_frames, np.nan, dtype=np.float64)
-            roi_maxes = np.full(n_frames, np.nan, dtype=np.float64)
-            hot_rows = np.full(n_frames, -1, dtype=int)
-            hot_cols = np.full(n_frames, -1, dtype=int)
-            for i in range(n_frames):
-                blob = find_roi_blob(stack[i], min_blob_px, temp_threshold)
-                if blob is not None:
-                    roi_means[i] = blob["roi_mean"]
-                    roi_maxes[i] = blob["roi_max"]
-                    hot_rows[i] = blob["max_row"]
-                    hot_cols[i] = blob["max_col"]
-
-        else:
-            # Dynamic: per-frame, find hottest pixel → extract ROI around it
-            flat = stack.reshape(n_frames, -1)
-            hot_idx = flat.argmax(axis=1)
-            hot_rows = hot_idx // width
-            hot_cols = hot_idx % width
-            roi_means = np.empty(n_frames, dtype=np.float64)
-            roi_maxes = np.empty(n_frames, dtype=np.float64)
-            rh2, rw2 = roi_h // 2, roi_w // 2
-            for i in range(n_frames):
-                r, c = int(hot_rows[i]), int(hot_cols[i])
-                r0 = max(0, r - rh2); r1 = min(height, r0 + roi_h); r0 = max(0, r1 - roi_h)
-                c0 = max(0, c - rw2); c1 = min(width, c0 + roi_w); c0 = max(0, c1 - roi_w)
-                patch = stack[i, r0:r1, c0:c1]
-                roi_means[i] = patch.mean()
-                roi_maxes[i] = patch.max()
-            hot_rows = hot_rows.astype(int)
-            hot_cols = hot_cols.astype(int)
-
-        # Max pixel per frame — blob mode reuses its own per-frame results;
-        # other modes use the global argmax over the (arena-masked) stack.
-        if roi_mode == "blob":
-            max_rows = hot_rows          # -1 where no blob found
-            max_cols = hot_cols
-            max_temps = roi_maxes.copy() # NaN where no blob found
-        else:
             flat_max = stack.reshape(n_frames, -1)
             max_indices = flat_max.argmax(axis=1)
             max_rows = (max_indices // width).astype(int)
             max_cols = (max_indices % width).astype(int)
             max_temps = flat_max[np.arange(n_frames), max_indices]
-
-        # ── 8. Time axis ──────────────────────────────────────────────────
-        t0 = timestamps.iloc[0]
-        time_s = np.array([(ts - t0).total_seconds() for ts in timestamps])
-
-        # ── 9. Temporal smoothing ─────────────────────────────────────────
-        sw = settings_dict["savgol_window"]
-        # Blob mode can produce NaN for frames where no animal was detected.
-        # Linearly interpolate gaps of ≤2 consecutive missed frames before
-        # smoothing so short blink-outs don't break the Savitzky-Golay filter.
-        if roi_mode == "blob" and np.isnan(roi_maxes).any():
-            roi_maxes_for_smooth = (
-                pd.Series(roi_maxes)
-                .interpolate(method="linear", limit=2, limit_direction="both")
-                .to_numpy()
-            )
+            head_max = np.full(n_frames, np.nan)
+            head_clipped = np.zeros(n_frames, dtype=bool)
         else:
-            roi_maxes_for_smooth = roi_maxes
-        roi_max_smoothed = temporal_smooth(roi_maxes_for_smooth, window=sw)
+            # Body tracking (default): adaptive segmentation + quality gating
+            # (see mouse_tracker.py).  Invalid frames are NaN, never dips.
+            if settings_dict.get("arena_enabled"):
+                # Everything outside the arena rectangle is replaced by the frame
+                # median so warm objects outside the box cannot be tracked.
+                inside = np.zeros((height, width), dtype=bool)
+                ax0, ay0 = max(0, settings_dict["arena_x"]), max(0, settings_dict["arena_y"])
+                inside[ay0:ay0 + settings_dict["arena_h"], ax0:ax0 + settings_dict["arena_w"]] = True
+                med = np.median(stack.reshape(n_frames, -1), axis=1)
+                stack[:, ~inside] = med[:, None]
+            roi_mode = "body"
+            body_info = track_body(stack, time_s, fps)
+            roi_means = body_info["roi_mean"]
+            roi_maxes = body_info["roi_max"]
+            valid = body_info["valid"]
+            # Trajectory = body centroid (stable), not the noisy hottest pixel
+            max_rows = np.where(valid, np.round(body_info["cent_row"]), -1).astype(int)
+            max_cols = np.where(valid, np.round(body_info["cent_col"]), -1).astype(int)
+            max_temps = roi_maxes.copy()
+            head_max = body_info["head_max"]
+            head_clipped = body_info["head_clipped"]
+            speed, moving, body_len = compute_activity(
+                body_info["cent_row"], body_info["cent_col"], time_s, valid,
+                body_info["body_area"], fps)
+        # ── 8. Coat emissivity correction of the temperature series ─────────
+        # Segmentation above ran on the sensor values; the correction (physics in
+        # roi_analysis.correct_emissivity) is applied to the read-out temperatures only.
+        # T_core keeps the uncorrected series: its regression was calibrated on raw camera
+        # skin temperatures, so correcting the input would shift the estimate.
+        roi_maxes_sensor = roi_maxes.copy()
+        emis_info = None
+        if settings_dict["apply_emissivity"]:
+            eps_s = float(settings_dict["epsilon_sensor"])
+            eps_m = float(settings_dict["epsilon_mouse"])
+            t_refl = settings_dict.get("reflected_temp_c")
+            if t_refl is None:       # room/bedding temperature ≈ cold floor of the image
+                t_refl = float(np.median(np.percentile(stack.reshape(n_frames, -1), 10, axis=1)))
+            def _fix(a):
+                return correct_emissivity(a, eps_m, eps_s, t_refl)
+            roi_means, roi_maxes, max_temps, head_max = (
+                _fix(roi_means), _fix(roi_maxes), _fix(max_temps), _fix(head_max))
+            emis_info = {"eps_true": eps_m, "eps_sensor": eps_s, "t_refl_c": t_refl}
+            if body_info is not None:
+                body_info["body_p90"] = _fix(body_info["body_p90"])
 
-        # ── 10. Normalisation ─────────────────────────────────────────────
+        # ── 9. Temporal smoothing (window defined at the 10 FPS reference) ─
+        # Gaps ≤ 2 s are bridged by time-based interpolation; longer gaps stay
+        # NaN (absent data is shown as absent, never as a dip).  The Savitzky-
+        # Golay window is rescaled to the measured rate so it spans the same
+        # number of seconds regardless of camera frame rate.
+        sw = int(settings_dict["savgol_window"])
+        sw_eff = max(5, int(round(sw * fps / 10.0)) | 1)
+        bridged = bridge_gaps(roi_maxes, time_s)
+        gaps = np.isnan(bridged)
+        if gaps.all():
+            roi_max_smoothed = bridged.copy()
+        else:
+            filled = np.interp(time_s, time_s[~gaps], bridged[~gaps])
+            roi_max_smoothed = temporal_smooth(filled, window=sw_eff)
+            roi_max_smoothed[gaps] = np.nan
+        # ── 10. Normalisation (baseline starts after the settling period) ──
         baseline_end = settings_dict["baseline_end_sec"]
-        normalized_roi_max = normalize_to_baseline(roi_maxes, time_s, baseline_end)
+        baseline_start = settle_s if settle_s < baseline_end else 0.0
+        normalized_roi_max = normalize_to_baseline(roi_maxes, time_s, baseline_end,
+                                                   baseline_start)
 
         # ── 11. T_core estimation ─────────────────────────────────────────
         tcore_result = None
         if settings_dict["tcore_enabled"]:
             sample_times, tskin_max, tcore_est = compute_tcore_estimate(
-                roi_maxes,
-                fps=settings_dict["fps"],
+                roi_maxes_sensor,
+                fps=fps,
                 sampling_interval_sec=settings_dict["tcore_sampling_interval_sec"],
                 averaging_window_min=settings_dict["tcore_averaging_window_min"],
                 slope=settings_dict["tcore_slope"],
                 intercept=settings_dict["tcore_intercept"],
+                time_s=time_s,
+                settle_s=settle_s,
             )
             tcore_result = {
                 "time_s": sample_times.tolist(),
@@ -286,6 +289,10 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
             "time_s": time_s.tolist(),
             "roi_mean": roi_means.tolist(),
             "roi_max": roi_maxes.tolist(),
+            "roi_max_sensor": roi_maxes_sensor.tolist(),
+            "head_max": head_max.tolist(),
+            "head_clipped": head_clipped.tolist(),
+            "emissivity": emis_info,
             "roi_max_smoothed": roi_max_smoothed.tolist(),
             "normalized_roi_max": normalized_roi_max.tolist(),
             "max_row": max_rows.tolist(),
@@ -294,6 +301,20 @@ def _parse_single_file(path: str, settings_dict: dict) -> Optional[dict]:
             "tcore": tcore_result,
             # Store raw stack reference as path for video export
             "stack_shape": list(stack.shape),
+            "fps_measured": fps,
+            "settle_s": settle_s,
+            "in_settle": (time_s < settle_s).tolist(),
+            "gap_before_s": gap_before.tolist(),
+            "pauses": pauses,
+            "tracking": (None if body_info is None else {
+                "valid": body_info["valid"].tolist(),
+                "reason": body_info["reason"].tolist(),
+                "body_area": body_info["body_area"].tolist(),
+                "body_p90": body_info["body_p90"].tolist(),
+                "speed_px_s": speed.tolist(),
+                "moving": moving.tolist(),
+                "body_len_px": body_len,
+            }),
         }
 
     except Exception as exc:
@@ -313,6 +334,19 @@ def result_to_dataframes(result: dict) -> Tuple[pd.DataFrame, Optional[pd.DataFr
         "max_col": result["max_col"],
         "max_temp": result["max_temp"],
     })
+    roi_df["in_settle"] = result["in_settle"]
+    roi_df["gap_before_s"] = result["gap_before_s"]
+    roi_df["roi_max_sensor"] = result["roi_max_sensor"]
+    roi_df["head_max"] = result["head_max"]
+    roi_df["head_clipped"] = result["head_clipped"]
+    trk = result.get("tracking")
+    if trk:
+        roi_df["body_valid"] = trk["valid"]
+        roi_df["body_area_px"] = trk["body_area"]
+        roi_df["body_p90"] = trk["body_p90"]
+        roi_df["speed_px_s"] = trk["speed_px_s"]
+        roi_df["moving"] = trk["moving"]
+        roi_df.attrs["body_len_px"] = trk["body_len_px"]
 
     tcore_df = None
     if result.get("tcore"):
@@ -385,10 +419,26 @@ def parse_files_parallel(
     return results
 
 
-def load_raw_frames(path: str, settings) -> Optional[np.ndarray]:
+def measure_fps(path: str, default: float = 10.0, n_rows: int = 1200) -> float:
+    """Frame rate of a recording from its own timestamps (first ``n_rows`` frames)."""
+    from .mouse_tracker import estimate_fps
+    try:
+        col = pd.read_csv(path, header=None, usecols=[0], dtype=str,
+                          nrows=n_rows, on_bad_lines="skip")
+        ts = pd.to_datetime(col.iloc[:, 0], errors="coerce", utc=True).dropna()
+        if len(ts) < 3:
+            return default
+        return estimate_fps((ts - ts.iloc[0]).dt.total_seconds().to_numpy(), default)
+    except Exception:
+        return default
+
+
+def load_raw_frames(path: str, settings, return_times: bool = False):
     """
     Load raw (N, H, W) pixel stack from a .txt file — used by VideoExporter.
-    Returns None on error.
+    Returns None on error.  With ``return_times`` returns ``(stack, time_s)`` where ``time_s``
+    are the real per-frame times in seconds (None if they cannot be aligned), so a recorder
+    pause is visible to the caller.
     """
     from dataclasses import asdict as _asdict
     sd = _asdict(settings)
@@ -406,7 +456,18 @@ def load_raw_frames(path: str, settings) -> Optional[np.ndarray]:
         valid = ~np.isnan(pixels).any(axis=1)
         result = pixels[valid].reshape(-1, height, width)
         del pixels
-        return result
+        if not return_times:
+            return result
+        times = None
+        try:
+            col = pd.read_csv(path, header=None, usecols=[0], dtype=str,
+                              on_bad_lines="skip", engine="c")
+            ts = pd.to_datetime(col.iloc[:, 0], errors="coerce", utc=True)
+            if len(ts) == len(valid) and ts.notna().all():
+                times = (ts[valid] - ts.iloc[0]).dt.total_seconds().to_numpy()
+        except Exception:
+            times = None
+        return result, times
     except Exception as exc:
         log.error("Failed to load frames from %s: %s", path, exc)
         return None

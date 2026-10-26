@@ -17,7 +17,9 @@ from typing import Callable, List, Optional
 import cv2
 import numpy as np
 
-from .parser import load_raw_frames
+from .mouse_tracker import collapse_pauses, track_body
+from .parser import load_raw_frames, measure_fps
+from ..utils.naming import animal_from_stem
 
 log = logging.getLogger(__name__)
 
@@ -51,11 +53,55 @@ def _apply_colormap(frame_hw: np.ndarray, t_min: float, t_max: float,
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
+def _render_strip(tr: dict, w: int, h: int, fps: float, settle_s: float) -> dict:
+    """Pre-render the temperature trace shown under a panel (cursor added per frame)."""
+    y = tr["roi_max"]
+    n = len(y)
+    base = np.full((h, w, 3), 30, dtype=np.uint8)
+    fin = np.isfinite(y)
+    lo, hi = (np.nanpercentile(y, [1, 99]) if fin.any() else (0.0, 1.0))
+    pad = max(0.3, 0.1 * (hi - lo))
+    lo, hi = lo - pad, hi + pad
+    xs = np.linspace(4, w - 5, n)
+    ys = (h - 14) - (np.nan_to_num(y, nan=lo) - lo) / (hi - lo) * (h - 24)
+    if settle_s > 0:
+        x1 = int(4 + (w - 9) * min(1.0, settle_s * fps / max(n - 1, 1)))
+        base[:, 4:x1] = (52, 52, 52)
+    for i in np.flatnonzero(~tr["valid"]):              # untracked = red tick at the bottom
+        base[h - 8:h - 2, int(xs[i])] = (60, 60, 255)
+    seg = np.flatnonzero(np.diff(np.concatenate([[0], fin.astype(int), [0]])))
+    for s, e in zip(seg[::2], seg[1::2]):               # tracked runs = continuous polyline
+        if e - s >= 2:
+            pts = np.stack([xs[s:e], ys[s:e]], axis=1).astype(np.int32)
+            cv2.polylines(base, [pts], False, (110, 200, 120), 1, cv2.LINE_AA)
+    cv2.putText(base, f"{hi - pad:.1f}", (w - 34, 11), _FONT, 0.32, (170, 170, 170), 1)
+    cv2.putText(base, f"{lo + pad:.1f}", (w - 34, h - 16), _FONT, 0.32, (170, 170, 170), 1)
+    return {"img": base, "xs": xs, "ys": ys, "n": n}
+
+
+def _render_colorbar(w: int, h: int, t_min: float, t_max: float, cmap) -> np.ndarray:
+    """Shared temperature scale drawn under the panels."""
+    bar = np.full((h, w, 3), 30, dtype=np.uint8)
+    x0, x1 = 60, w - 60
+    grad = np.tile(np.linspace(0, 1, x1 - x0, dtype=np.float32), (h - 12, 1))
+    rgb = (cmap(grad)[:, :, :3] * 255).astype(np.uint8)
+    bar[3:h - 9, x0:x1] = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    for frac in (0, 0.25, 0.5, 0.75, 1):
+        x = int(x0 + frac * (x1 - x0 - 1))
+        cv2.putText(bar, f"{t_min + frac * (t_max - t_min):.1f}", (x - 12, h - 1),
+                    _FONT, 0.3, (200, 200, 200), 1)
+    cv2.putText(bar, "deg C", (8, h // 2 + 4), _FONT, 0.38, (200, 200, 200), 1)
+    return bar
+
+
 def export_video(
     file_paths: List[str],
     output_path: str,
     settings,
     progress_callback: Optional[Callable[[int], None]] = None,
+    labels: Optional[List[str]] = None,
+    group_name: str = "",
+    date_str: str = "",
 ) -> bool:
     """
     Export a multi-panel thermal video to ``output_path``.
@@ -78,9 +124,16 @@ def export_video(
     panel_h = int(panel_w * settings.camera_height / settings.camera_width)
     header_h = 36
     canvas_w = panel_w * n_cams
-    canvas_h = panel_h + header_h
+    body_mode = settings.roi_mode != "static"
+    strip_h = 64 if body_mode else 0      # live temperature trace under each panel
+    cbar_h = 26                           # shared colour scale
+    canvas_h = header_h + panel_h + strip_h + cbar_h
 
-    fps_out = settings.fps if settings.fps > 0 else 10.0
+    # Play back in real time: use the rate measured from the recordings' own
+    # timestamps (the nominal setting can be far off, e.g. 6 Hz vs 10 Hz).
+    nominal = settings.fps if settings.fps > 0 else 10.0
+    fps_out = float(np.median([measure_fps(fp, nominal) for fp in file_paths]))
+    log.info("Video frame rate: %.2f fps (nominal setting %.1f)", fps_out, nominal)
 
     # ── Try to open VideoWriter ───────────────────────────────────────────
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -99,16 +152,32 @@ def export_video(
 
     # ── Load all camera stacks ────────────────────────────────────────────
     stacks = []
+    frame_times = []     # real per-frame times (a recorder pause shows up as a jump)
     for fp in file_paths:
-        stack = load_raw_frames(fp, settings)
+        loaded = load_raw_frames(fp, settings, return_times=True)
+        stack, ftimes = loaded if loaded is not None else (None, None)
         if stack is None:
             log.error("Failed to load frames from %s", fp)
             writer.release()
             return False
         stacks.append(stack)
+        frame_times.append(ftimes)
 
     n_frames = min(s.shape[0] for s in stacks)
     log.info("Exporting %d frames × %d cameras → %s", n_frames, n_cams, output_path)
+
+    # Body tracking per camera (same tracker as the analysis) for the overlay
+    trackers = None
+    strips = None
+    if body_mode:
+        trackers = [track_body(s.astype(np.float64),
+                               collapse_pauses(ft)[0] if ft is not None else np.arange(s.shape[0]) / fps_out,
+                               fps_out)
+                    for s, ft in zip(stacks, frame_times)]
+        strips = [_render_strip(tr, panel_w, strip_h, fps_out, settings.settle_s)
+                  for tr in trackers]
+    cbar = _render_colorbar(canvas_w, cbar_h, settings.t_min, settings.t_max,
+                            _resolve_colormap(settings.colormap))
 
     t_min = settings.t_min
     t_max = settings.t_max
@@ -132,13 +201,25 @@ def export_video(
 
     # Pre-allocate canvas once; only image area is zeroed per frame
     canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    ref_times = None
+    if frame_times and frame_times[0] is not None:
+        ref_times = collapse_pauses(frame_times[0])[0]
 
     for frame_idx in range(n_frames):
         # Reset header and image areas in-place (no new allocation)
         canvas[:header_h, :] = (30, 30, 30)
         canvas[header_h:, :] = 0
+        canvas[header_h + panel_h + strip_h:, :] = cbar
 
-        header_text = f"Glod  |  Frame {frame_idx + 1:04d} / {n_frames:04d}"
+        # Recording clock with recorder pauses cut out (continues as if nothing happened)
+        t_real = float(ref_times[frame_idx]) if ref_times is not None else frame_idx / fps_out
+        elapsed = int(t_real)
+        header_text = "  |  ".join(filter(None, [
+            "Glod", group_name, date_str,
+            f"t {elapsed // 60:02d}:{elapsed % 60:02d}",
+            "SETTLING (excluded)" if t_real < settings.settle_s else "",
+            f"Frame {frame_idx + 1:04d} / {n_frames:04d}",
+        ]))
         cv2.putText(canvas, header_text, (10, 24), _FONT, 0.55, (200, 210, 205), 1,
                     cv2.LINE_AA)
 
@@ -149,8 +230,25 @@ def export_video(
             img_panel = cv2.resize(img_bgr, (panel_w, panel_h),
                                    interpolation=cv2.INTER_LINEAR)
 
-            # ── ROI box ───────────────────────────────────────────────────
-            if roi_mode == "static":
+            # ── ROI box / tracked body ────────────────────────────────────
+            tr = trackers[cam_idx] if trackers else None
+            if tr is not None:
+                ok = bool(tr["valid"][frame_idx])
+                cr, cc = tr["cent_row"][frame_idx], tr["cent_col"][frame_idx]
+                if np.isfinite(cr):
+                    # green = used for analysis, red = rejected frame (not in the trace)
+                    col = (80, 220, 80) if ok else (60, 60, 255)
+                    cx, cy = int(cc * scale_x), int(cr * scale_y)
+                    cv2.drawMarker(img_panel, (cx, cy), col, cv2.MARKER_CROSS, 14, 2)
+                    mk = cv2.resize(tr["masks"][frame_idx].astype(np.uint8), (panel_w, panel_h),
+                                    interpolation=cv2.INTER_NEAREST)
+                    cnts, _ = cv2.findContours(mk, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(img_panel, cnts, -1, col, 1, cv2.LINE_AA)
+                if ok:
+                    hx = int((tr["max_col"][frame_idx] + 0.5) * scale_x)
+                    hy = int((tr["max_row"][frame_idx] + 0.5) * scale_y)
+                    cv2.circle(img_panel, (hx, hy), 6, (255, 255, 255), 1, cv2.LINE_AA)
+            elif roi_mode == "static":
                 cv2.rectangle(img_panel, (sx0, sy0), (sx1, sy1), (255, 255, 255), 2)
             else:
                 # Dynamic: find hottest pixel in this frame → draw ROI
@@ -167,20 +265,31 @@ def export_video(
                                (255, 255, 255), 2)
 
             # ── Temperature annotation ────────────────────────────────────
-            if roi_mode == "static":
-                roi_temp = float(frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w].max())
+            if tr is not None:
+                v = tr["roi_max"][frame_idx]
+                label = f"{v:.1f}C" if np.isfinite(v) else "body not tracked"
+            elif roi_mode == "static":
+                label = f"{float(frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w].max()):.1f}C"
             else:
-                roi_temp = float(frame.max())
-            cv2.putText(img_panel, f"{roi_temp:.1f}C",
+                label = f"{float(frame.max()):.1f}C"
+            cv2.putText(img_panel, label,
                         (6, panel_h - 8), _FONT, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
-            cam_label = Path(file_paths[cam_idx]).stem[-12:]
-            cv2.putText(img_panel, cam_label, (6, 18), _FONT, 0.4,
-                        (200, 210, 205), 1, cv2.LINE_AA)
+            cam_label = (labels[cam_idx] if labels and cam_idx < len(labels)
+                         else animal_from_stem(Path(file_paths[cam_idx]).stem))
+            cv2.putText(img_panel, cam_label, (6, 20), _FONT, 0.6,
+                        (255, 255, 255), 2, cv2.LINE_AA)
 
             # ── Paste panel into canvas ───────────────────────────────────
             x_off = cam_idx * panel_w
-            canvas[header_h:, x_off:x_off + panel_w] = img_panel
+            canvas[header_h:header_h + panel_h, x_off:x_off + panel_w] = img_panel
+            if strips is not None:
+                st = strips[cam_idx]
+                sc = st["img"].copy()
+                cx_ = int(st["xs"][min(frame_idx, st["n"] - 1)])
+                cv2.line(sc, (cx_, 0), (cx_, strip_h - 1), (255, 255, 255), 1)
+                canvas[header_h + panel_h:header_h + panel_h + strip_h,
+                       x_off:x_off + panel_w] = sc
 
         writer.write(canvas)
 

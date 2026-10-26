@@ -7,8 +7,8 @@ VideoWorker  — multi-panel video export
 
 from __future__ import annotations
 
+import dataclasses
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -19,10 +19,13 @@ from scipy import stats as sp_stats
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from .parser import parse_files_parallel, result_to_dataframes
-from .roi_analysis import smooth_series
-from .stats import GroupStatsTester, extract_per_file_metrics
+from .roi_analysis import bin_mean, emissivity_offset_c, nan_interp
+from .stats import (GroupStatsTester, MIN_BIN_COVERAGE, extract_per_file_metrics, qc_flag,
+                    run_timepoint_stats, timepoint_label)
 from .video_exporter import export_video
-from ..utils.config import AnalysisSettings, DOWN_SAMPLE_PERIOD_SEC, OUTPUT_DIR_PREFIX
+from .publication import write_run_package
+from ..utils import naming
+from ..utils.config import AnalysisSettings, DOWN_SAMPLE_PERIOD_SEC
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +51,12 @@ class GroupData:
         self.tcore_sem: Optional[np.ndarray] = None
 
         self.per_file_metrics: Dict[str, dict] = {}
+        self.animal_series: Dict[str, dict] = {}   # stem → 30-s bin series (abs/norm/tcore)
+        self.abs_mean: Optional[np.ndarray] = None
+        self.abs_sem: Optional[np.ndarray] = None
+        self.coat_label: Optional[str] = None   # animal/coat preset chosen for this group
+        self.epsilon: Optional[float] = None     # fur/skin emissivity used for this group
+        self.settle_s: float = 0.0   # seconds excluded after placing the animal (plots shade it)
 
 
 # ── Parse Worker ─────────────────────────────────────────────────────────────
@@ -75,6 +84,23 @@ class ParseWorker(QThread):
         self.settings = settings
         self.output_root = Path(output_root)
 
+    # ── Naming (see utils/naming.py) ──────────────────────────────────────
+    def _run_date(self) -> str:
+        # output_root is <project>/analysis/<YYYY-MM-DD_HHMMSS>
+        name = self.output_root.name
+        return name[:10] if len(name) >= 10 else naming.today()
+
+    def _name(self, group: str, stem, kind: str) -> str:
+        """<date>_<group>[_<animal>]_<kind>.csv ; date = recording date if known."""
+        if stem is None:
+            return naming.build(kind, "csv", date=self._run_date(), group=group)
+        animal, rec_date = naming.split_stem(stem)
+        return naming.build(kind, "csv", date=rec_date or self._run_date(),
+                            group=group, animal=animal)
+
+    def _run_name(self, kind: str) -> str:
+        return naming.build(kind, "csv", date=self._run_date())
+
     def run(self):
         try:
             self._run()
@@ -83,8 +109,8 @@ class ParseWorker(QThread):
             self.error.emit(str(exc))
 
     def _run(self):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = self.output_root / f"{OUTPUT_DIR_PREFIX}_{ts}"
+        # output_root is the per-run folder chosen by the GUI; CSVs go in data/
+        out_dir = self.output_root / "data"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         all_files = [fp for g in self.groups for fp in g.file_paths]
@@ -92,16 +118,28 @@ class ParseWorker(QThread):
         files_done = 0
 
         all_group_data: Dict[str, GroupData] = {}
+        emis_by_group: Dict[str, dict] = {}
 
         for g in self.groups:
             self.log_message.emit(f"[{g.name}] Parsing {len(g.file_paths)} file(s)…")
             g_out_dir = out_dir / g.name
             g_out_dir.mkdir(parents=True, exist_ok=True)
 
-            # ── Parallel parsing ──────────────────────────────────────────
+            # ── Parallel parsing (emissivity is chosen per group) ─────────
+            eps_g = g.epsilon if g.epsilon else self.settings.epsilon_mouse
+            settings_g = dataclasses.replace(
+                self.settings, epsilon_mouse=eps_g,
+                coat_label=g.coat_label or self.settings.coat_label)
+            if self.settings.apply_emissivity:
+                off = emissivity_offset_c(eps_g, self.settings.epsilon_sensor)
+                self.log_message.emit(
+                    f"[{g.name}] emissivity ε = {eps_g:.2f} ({settings_g.coat_label}); sensor "
+                    f"assumed {self.settings.epsilon_sensor:.2f} → temperatures shifted "
+                    f"{off:+.2f} °C at 30.5 °C (T_core uses uncorrected sensor values).")
+            emis_by_group[g.name] = {"coat": settings_g.coat_label, "epsilon": eps_g}
             results = parse_files_parallel(
                 g.file_paths,
-                self.settings,
+                settings_g,
                 progress_callback=None,   # overall progress emitted per-file below
             )
 
@@ -119,20 +157,36 @@ class ParseWorker(QThread):
                 g.tcore_dfs[stem] = tcore_df
 
                 # ── Per-file CSV export ───────────────────────────────────
-                roi_df.to_csv(g_out_dir / f"{stem}_roi_data.csv", index=False)
-                self.log_message.emit(
-                    f"  ✓ {stem}: {result['n_frames']} frames"
-                )
+                roi_df.to_csv(g_out_dir / self._name(g.name, stem, "roi_data"), index=False)
+                fps_m = result.get("fps_measured", self.settings.fps)
+                msg = (f"  ✓ {stem}: {result['n_frames']} frames, "
+                       f"measured {fps_m:.2f} fps")
+                if result.get("pauses"):
+                    tot = sum(e - s for s, e in result["pauses"])
+                    self.log_message.emit(
+                        f"    ⏸ {stem}: recording was paused {len(result['pauses'])}× "
+                        f"({tot:.0f} s in total). Analysed as ONE continuous recording: the pause "
+                        "is cut out of the time axis and the data continue as if nothing happened.")
+                trk = result.get("tracking")
+                if trk:
+                    ok = float(np.mean(trk["valid"])) * 100
+                    msg += f", body tracked in {ok:.0f}% of frames"
+                self.log_message.emit(msg)
+                if abs(fps_m - self.settings.fps) > 0.15 * self.settings.fps:
+                    self.log_message.emit(
+                        f"    ⚠ measured rate {fps_m:.2f} fps differs from the {self.settings.fps:g} fps "
+                        "setting; all time windows use the measured rate.")
 
                 if tcore_df is not None:
                     s = self.settings
                     header = (
-                        f"# Settings: fps={s.fps}, sampling_interval_sec="
+                        f"# Settings: fps_measured={fps_m:.3f}, settle_s={s.settle_s:g}, "
+                        f"sampling_interval_sec="
                         f"{s.tcore_sampling_interval_sec}, averaging_window_min="
                         f"{s.tcore_averaging_window_min}, "
                         f"slope={s.tcore_slope}, intercept={s.tcore_intercept}\n"
                     )
-                    tc_path = g_out_dir / f"{stem}_tcore_estimated.csv"
+                    tc_path = g_out_dir / self._name(g.name, stem, "tcore_estimated")
                     with open(tc_path, "w") as fh:
                         fh.write(header)
                     tcore_df.to_csv(tc_path, index=False, mode="a")
@@ -141,9 +195,30 @@ class ParseWorker(QThread):
                 g.per_file_metrics[stem] = extract_per_file_metrics(
                     g.name, stem, roi_df, tcore_df,
                     baseline_end_sec=self.settings.baseline_end_sec,
+                    settle_s=self.settings.settle_s,
                 )
+                m = g.per_file_metrics[stem]
+                m["qc_flag"] = qc_flag(m, self.settings.min_coverage)
+                if m["qc_flag"] != "ok":
+                    self.log_message.emit(f"    ⚠ {stem}: {m['qc_flag']}")
 
                 self.progress.emit(int(files_done / total_files * 80))
+
+            # ── Multi-session check: same animal recorded more than once ──
+            by_animal: Dict[str, list] = {}
+            for stem in g.roi_dfs:
+                a, d = naming.split_stem(stem)
+                by_animal.setdefault(a, []).append(d or "?")
+            dates = sorted({naming.split_stem(s)[1] or "?" for s in g.roi_dfs})
+            if len(dates) > 1:
+                self.log_message.emit(
+                    f"[{g.name}] recordings from {len(dates)} sessions: {', '.join(dates)}")
+            repeated = {a: d for a, d in by_animal.items() if len(d) > 1}
+            if repeated:
+                self.log_message.emit(
+                    f"  ⚠ [{g.name}] animals with several recordings "
+                    f"({', '.join(sorted(repeated))}): statistics treat each recording "
+                    "as independent — use one recording per animal for inference.")
 
             # ── Group aggregation ─────────────────────────────────────────
             if g.roi_dfs:
@@ -158,14 +233,52 @@ class ParseWorker(QThread):
         # ── Statistical tests ─────────────────────────────────────────────
         self.log_message.emit("Running statistical tests…")
         # Build mock all_group_stats for GroupStatsTester
+        # Recordings with too little tracked body are listed in the QC table but kept
+        # out of the group statistics (min_coverage setting).
         mock_stats = {
-            g.name: {"per_file_metrics": g.per_file_metrics}
+            g.name: {"per_file_metrics": {
+                s: m for s, m in g.per_file_metrics.items()
+                if not str(m.get("qc_flag", "")).startswith("EXCLUDED")}}
             for g in self.groups
         }
-        stats_results = GroupStatsTester.run_all(mock_stats)
+        paired = bool(self.settings.paired_design) and len(self.groups) >= 2
+        stats_results = GroupStatsTester.run_all(mock_stats, paired=paired)
+        qc_rows = [{"group": g.name, "animal": naming.animal_from_stem(s),
+                    "recording": s, **m}
+                   for g in self.groups for s, m in g.per_file_metrics.items()]
+        stats_results["qc_df"] = pd.DataFrame(qc_rows)
+        stats_results["emissivity_by_group"] = emis_by_group
+        if paired:
+            m = stats_results.get("matching_df")
+            if m is not None and len(m):
+                n_ok = int(m["included_in_paired_analysis"].sum())
+                self.log_message.emit(
+                    f"Paired design: {n_ok} animal(s) present in all "
+                    f"{len(self.groups)} groups are compared; "
+                    f"{len(m) - n_ok} unmatched animal(s) excluded.")
+
+        # ── Time-point comparison (optional) ──────────────────────────────
+        if self.settings.timepoints_s:
+            self.log_message.emit("Comparing user-set time points…")
+            stats_results.update(run_timepoint_stats(
+                all_group_data, self.settings.timepoints_s,
+                self.settings.timepoint_signal, self.settings.timepoint_window_s,
+                paired=paired))
+            tp = stats_results["timepoint_df"]
+            for (g, t), sub in tp.groupby(["group", "timepoint_s"]):
+                missing = int(sub["value"].isna().sum())
+                if missing:
+                    self.log_message.emit(
+                        f"  ⚠ {g}: {missing}/{len(sub)} recording(s) end before "
+                        f"{timepoint_label(t)} and are excluded from that time point")
 
         # ── Save stats CSVs ───────────────────────────────────────────────
-        self._save_stats_csvs(stats_results, out_dir)
+        try:
+            write_run_package(self.output_root, self.groups, stats_results,
+                              self.settings, self._run_date())
+        except Exception as exc:
+            log.exception("Publication package failed: %s", exc)
+            self.log_message.emit(f"⚠ Could not write statistics package: {exc}")
 
         self.progress.emit(95)
 
@@ -182,6 +295,7 @@ class ParseWorker(QThread):
     def _aggregate_group(self, g: GroupData):
         """Interpolate all files to a common 30-s time axis and compute mean ± SEM."""
         roi_series = []
+        abs_series = []
         tcore_series = []
         max_t = 0.0
 
@@ -195,32 +309,59 @@ class ParseWorker(QThread):
         common_t = np.arange(0, max_t, DOWN_SAMPLE_PERIOD_SEC)
         g.common_t = common_t
 
+        settle = float(getattr(self.settings, "settle_s", 0.0))
+        g.settle_s = settle
+        half = DOWN_SAMPLE_PERIOD_SEC / 2.0
+        g.animal_series = {}
+
+        def _binned(t, y):
+            """30-s bin means of tracked frames; bins with < 20 % valid frames and the
+            settling period are NaN (shown as gaps, never as dips)."""
+            m = bin_mean(common_t, t, y, half)
+            cov = bin_mean(common_t, t, np.isfinite(y).astype(float), half)
+            m[(cov < MIN_BIN_COVERAGE) | (common_t + half <= settle)] = np.nan
+            return m
+
         for stem, roi_df in g.roi_dfs.items():
             if len(roi_df) < 2:
                 continue
             t = roi_df["time_s"].to_numpy()
-            interp_roi = np.interp(common_t, t, roi_df["normalized_roi_max"].to_numpy())
-            # Two-stage smoothing (Combine temp apap.py pattern)
-            interp_roi = smooth_series(interp_roi)
-            roi_series.append(interp_roi)
-
+            roi = roi_df["roi_max"].to_numpy()
+            bw = (t >= settle) & (t <= self.settings.baseline_end_sec) & np.isfinite(roi)
+            base_c = float(roi[bw].mean()) if bw.any() else np.nan
+            ser = {"abs": _binned(t, roi),
+                   "norm": _binned(t, roi_df["normalized_roi_max"].to_numpy()),
+                   "baseline_c": base_c,
+                   "excluded": str(g.per_file_metrics.get(stem, {}).get(
+                       "qc_flag", "")).startswith("EXCLUDED")}
             tdf = g.tcore_dfs.get(stem)
             if tdf is not None and len(tdf) >= 2:
-                t_tc = tdf["time_s"].to_numpy()
-                interp_tc = np.interp(common_t, t_tc, tdf["tcore_estimated"].to_numpy())
-                tcore_series.append(interp_tc)
+                ser["tcore"] = nan_interp(common_t, tdf["time_s"].to_numpy(),
+                                          tdf["tcore_estimated"].to_numpy())
+                ser["tskin"] = nan_interp(common_t, tdf["time_s"].to_numpy(),
+                                          tdf["tskin_max"].to_numpy())
+            ser["delta"] = ser["abs"] - base_c      # °C relative to the animal's own baseline
+            g.animal_series[stem] = ser
+            if ser["excluded"]:
+                continue          # low-coverage animals stay out of group curves
+            roi_series.append(ser["norm"])
+            abs_series.append(ser["abs"])
+            if "tcore" in ser:
+                tcore_series.append(ser["tcore"])
+        def _mean_sem(rows):
+            mat = np.vstack(rows)
+            n = np.sum(np.isfinite(mat), axis=0)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                mean = np.where(n > 0, np.nansum(mat, axis=0) / np.maximum(n, 1), np.nan)
+                sd = np.sqrt(np.nansum((mat - mean) ** 2, axis=0) / np.maximum(n - 1, 1))
+                sem = np.where(n > 1, sd / np.sqrt(np.maximum(n, 1)), 0.0)
+            return mean, np.where(n > 0, sem, np.nan)
 
         if roi_series:
-            mat = np.vstack(roi_series)
-            g.roi_mean = mat.mean(axis=0)
-            g.roi_sem = (sp_stats.sem(mat, axis=0) if mat.shape[0] > 1
-                         else np.zeros(len(common_t)))
-
+            g.roi_mean, g.roi_sem = _mean_sem(roi_series)
+            g.abs_mean, g.abs_sem = _mean_sem(abs_series)
         if tcore_series:
-            mat_tc = np.vstack(tcore_series)
-            g.tcore_mean = mat_tc.mean(axis=0)
-            g.tcore_sem = (sp_stats.sem(mat_tc, axis=0) if mat_tc.shape[0] > 1
-                           else np.zeros(len(common_t)))
+            g.tcore_mean, g.tcore_sem = _mean_sem(tcore_series)
 
     def _save_group_csvs(self, g: GroupData, g_out_dir: Path):
         if g.common_t is not None and g.roi_mean is not None:
@@ -229,7 +370,8 @@ class ParseWorker(QThread):
                 "roi_mean": g.roi_mean,
                 "roi_sem": g.roi_sem if g.roi_sem is not None else 0.0,
             })
-            roi_summary.to_csv(g_out_dir / "group_roi_summary.csv", index=False)
+            roi_summary.to_csv(
+                g_out_dir / self._name(g.name, None, "group_roi_summary"), index=False)
 
         if g.common_t is not None and g.tcore_mean is not None:
             tc_summary = pd.DataFrame({
@@ -237,20 +379,8 @@ class ParseWorker(QThread):
                 "tcore_mean": g.tcore_mean,
                 "tcore_sem": g.tcore_sem if g.tcore_sem is not None else 0.0,
             })
-            tc_summary.to_csv(g_out_dir / "group_tcore_summary.csv", index=False)
-
-    def _save_stats_csvs(self, stats_results: dict, out_dir: Path):
-        if stats_results.get("per_file_df") is not None:
-            stats_results["per_file_df"].to_csv(
-                out_dir / "per_file_metrics.csv", index=False)
-
-        if stats_results.get("test_rows"):
-            pd.DataFrame(stats_results["test_rows"]).to_csv(
-                out_dir / "statistical_tests.csv", index=False)
-
-        if stats_results.get("posthoc_rows"):
-            pd.DataFrame(stats_results["posthoc_rows"]).to_csv(
-                out_dir / "posthoc_tests.csv", index=False)
+            tc_summary.to_csv(
+                g_out_dir / self._name(g.name, None, "group_tcore_summary"), index=False)
 
     def _save_multgroup_timeseries(self, all_group_data: dict, out_dir: Path):
         dfs = []
@@ -272,40 +402,50 @@ class ParseWorker(QThread):
             from functools import reduce
             merged = reduce(lambda a, b: pd.merge(a, b, on="time_s", how="outer"), dfs)
             merged.sort_values("time_s").to_csv(
-                out_dir / "multi_group_timeseries.csv", index=False)
+                out_dir / self._run_name("multi_group_timeseries"), index=False)
 
 
 # ── Video Worker ──────────────────────────────────────────────────────────────
 
 class VideoWorker(QThread):
-    """Background worker for video export."""
+    """Background worker for video export.
+
+    ``jobs`` is a list of dicts: {file_paths, output_path, labels, group, date}.
+    Each job produces one video (group tile or single animal).
+    """
 
     progress = pyqtSignal(int)
     log_message = pyqtSignal(str)
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, file_paths: List[str], output_path: str,
-                 settings: AnalysisSettings, parent=None):
+    def __init__(self, jobs: List[dict], settings: AnalysisSettings, parent=None):
         super().__init__(parent)
-        self.file_paths = file_paths
-        self.output_path = output_path
+        self.jobs = jobs
         self.settings = settings
 
     def run(self):
         try:
-            self.log_message.emit(
-                f"Exporting video: {len(self.file_paths)} cameras → {self.output_path}")
-            ok = export_video(
-                self.file_paths,
-                self.output_path,
-                self.settings,
-                progress_callback=lambda p: self.progress.emit(p),
-            )
-            if ok:
-                self.finished.emit(self.output_path)
-            else:
-                self.error.emit("Video export failed — check log for details.")
+            n = len(self.jobs)
+            done, failed = [], []
+            for i, job in enumerate(self.jobs):
+                self.log_message.emit(
+                    f"Exporting video {i + 1}/{n}: {Path(job['output_path']).name}")
+                ok = export_video(
+                    job["file_paths"], job["output_path"], self.settings,
+                    progress_callback=lambda p, i=i: self.progress.emit(
+                        int((i * 100 + p) / n)),
+                    labels=job.get("labels"),
+                    group_name=job.get("group", ""),
+                    date_str=job.get("date", ""),
+                )
+                (done if ok else failed).append(job["output_path"])
+            self.progress.emit(100)
+            if failed:
+                self.error.emit("Video export failed for: "
+                                + ", ".join(Path(f).name for f in failed))
+            if done:
+                self.finished.emit(str(Path(done[0]).parent))
         except Exception as exc:
             log.exception("VideoWorker fatal error: %s", exc)
             self.error.emit(str(exc))

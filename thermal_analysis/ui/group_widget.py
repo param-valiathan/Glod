@@ -9,10 +9,14 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QLineEdit,
     QPushButton, QFileDialog, QFrame, QCheckBox, QColorDialog,
-    QSizePolicy,
+    QSizePolicy, QComboBox, QDoubleSpinBox,
 )
 from PyQt6.QtGui import QColor
 from PyQt6.QtCore import pyqtSignal, Qt
+
+from ..processing.roi_analysis import emissivity_offset_c
+from ..utils.coat_presets import (CUSTOM_LABEL, DEFAULT_PRESET, PRESETS,
+                                  emissivity_for, note_for)
 
 
 _DEFAULT_COLORS = [
@@ -71,6 +75,7 @@ class FolderGroupWidget(QFrame):
 
     removed = pyqtSignal(object)        # emits self
     color_changed = pyqtSignal(object)  # emits self (so MainWindow can look up group_name + color)
+    changed = pyqtSignal()              # name or folder changed (animal matching may differ)
 
     def __init__(self, index: int, parent=None):
         super().__init__(parent)
@@ -89,6 +94,7 @@ class FolderGroupWidget(QFrame):
         self._name_edit = QLineEdit(f"Group {index}")
         self._name_edit.setPlaceholderText("Group name…")
         self._name_edit.setFixedHeight(28)
+        self._name_edit.editingFinished.connect(self.changed.emit)
 
         self._color_btn = ColorButton(default_color)
         self._color_btn.color_changed.connect(lambda _c: self.color_changed.emit(self))
@@ -108,9 +114,28 @@ class FolderGroupWidget(QFrame):
         self._video_cb = QCheckBox("Export video")
         self._video_cb.setChecked(False)
 
+        # Animal / coat → emissivity (see utils/coat_presets.py for the literature basis)
+        self._coat_combo = QComboBox()
+        self._coat_combo.addItems([lbl for lbl, _, _ in PRESETS] + [CUSTOM_LABEL])
+        self._coat_combo.setCurrentText(DEFAULT_PRESET)
+        self._coat_combo.setFixedHeight(26)
+        self._eps_custom = QDoubleSpinBox()
+        self._eps_custom.setRange(0.50, 1.00)
+        self._eps_custom.setDecimals(2)
+        self._eps_custom.setSingleStep(0.01)
+        self._eps_custom.setValue(0.95)
+        self._eps_custom.setPrefix("ε ")
+        self._eps_custom.setVisible(False)
+        self._coat_info = QLabel("")
+        self._coat_info.setWordWrap(True)
+        self._coat_info.setStyleSheet("color: #6C757D; font-size: 10px;")
+        self._coat_combo.currentTextChanged.connect(self._coat_changed)
+        self._eps_custom.valueChanged.connect(lambda _v: self._coat_changed())
+
         remove_btn = QPushButton("✕")
         remove_btn.setObjectName("DangerButton")
-        remove_btn.setFixedSize(26, 26)
+        remove_btn.setFixedSize(28, 28)
+        remove_btn.setStyleSheet("padding: 0px; min-height: 0px; min-width: 0px;")
         remove_btn.setToolTip("Remove this group")
         remove_btn.clicked.connect(lambda: self.removed.emit(self))
 
@@ -136,7 +161,16 @@ class FolderGroupWidget(QFrame):
         row3.addWidget(self._video_cb)
         root.addLayout(row3)
 
+        # Row 4: animal / coat selector
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Animal / coat"))
+        row4.addWidget(self._coat_combo, 1)
+        row4.addWidget(self._eps_custom)
+        root.addLayout(row4)
+        root.addWidget(self._coat_info)
+
         self._folder_path: str = ""
+        self._coat_changed()
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -147,6 +181,25 @@ class FolderGroupWidget(QFrame):
     @property
     def color(self) -> str:
         return self._color_btn.color
+
+    @property
+    def coat_label(self) -> str:
+        return (f"Custom ε = {self._eps_custom.value():.2f}"
+                if self._coat_combo.currentText() == CUSTOM_LABEL
+                else self._coat_combo.currentText())
+
+    @property
+    def emissivity(self) -> float:
+        return emissivity_for(self._coat_combo.currentText(), self._eps_custom.value())
+
+    def _coat_changed(self, *_):
+        custom = self._coat_combo.currentText() == CUSTOM_LABEL
+        self._eps_custom.setVisible(custom)
+        off = emissivity_offset_c(self.emissivity)
+        self._coat_info.setText(
+            f"ε = {self.emissivity:.2f} · shifts a 30.5 °C reading by {off:+.2f} °C "
+            f"(camera assumes 0.95). " + note_for(self._coat_combo.currentText()))
+        self.changed.emit()
 
     @property
     def folder_path(self) -> str:
@@ -164,6 +217,16 @@ class FolderGroupWidget(QFrame):
         files = sorted(p.glob("*.txt")) + sorted(p.glob("*/*.txt"))
         return [str(f) for f in files]
 
+    @staticmethod
+    def describe_folder(folder: str) -> str:
+        """"📁 name (N recordings · K session(s))" — sessions = distinct recording dates."""
+        from ..utils.naming import split_stem
+        p = Path(folder)
+        files = list(p.glob("*.txt")) + list(p.glob("*/*.txt"))
+        dates = {split_stem(f.stem)[1] for f in files} - {None}
+        s = f" · {len(dates)} session(s)" if dates else ""
+        return f"📁 {p.name}  ({len(files)} recording(s){s})"
+
     def is_valid(self) -> bool:
         return bool(self._folder_path) and Path(self._folder_path).is_dir()
 
@@ -174,5 +237,5 @@ class FolderGroupWidget(QFrame):
             self, "Select Experiment Folder", self._folder_path or "")
         if folder:
             self._folder_path = folder
-            txt_count = len(list(Path(folder).glob("*.txt")))
-            self._path_label.setText(f"📁 {Path(folder).name}  ({txt_count} .txt file(s))")
+            self._path_label.setText(self.describe_folder(folder))
+            self.changed.emit()

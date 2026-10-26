@@ -1,5 +1,5 @@
 """
-Matplotlib figure builders for Glöd (10 plot types).
+Matplotlib figure builders for Glöd.
 
 All functions return a matplotlib.figure.Figure.
 Figures use a clean Scandinavian white background with muted charcoal text.
@@ -13,10 +13,10 @@ import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.figure import Figure
+import textwrap
+from ..processing.stats import bias_flagged, bias_sentence
 from scipy.ndimage import gaussian_filter1d
 
-from ..processing.roi_analysis import poly_fit, rate_of_change, smooth_series
-from ..utils.config import POLY_DEGREE
 
 # ── Style constants ───────────────────────────────────────────────────────────
 _BG = "#FFFFFF"
@@ -70,290 +70,362 @@ def _sig_bracket(ax, x1, x2, y, label, color="black", lw=1.2):
             fontsize=10, color=color)
 
 
-# ── 1. Normalised ROI time series (Combine temp apap.py style) ───────────────
+def _shade_settle(ax, settle_s: float) -> None:
+    """Grey band over the settling period that is excluded from baseline / metrics."""
+    if settle_s and settle_s > 0:
+        ax.axvspan(0, settle_s, color="#ADB5BD", alpha=0.18, lw=0, zorder=0)
+        ymax = ax.get_ylim()[1]
+        ax.text(settle_s / 2, ymax, "settling\n(excluded)", ha="center", va="top",
+                fontsize=7, color="#6C757D")
 
-def build_normalized_roi(all_group_data: dict) -> Figure:
-    """Multi-group normalised ROI max over time with SEM shaded bands + poly fit."""
+
+def _settle_of(roi_df: pd.DataFrame) -> float:
+    """Settling period recorded in a per-file frame (0 when the column is absent)."""
+    if "in_settle" in roi_df.columns and roi_df["in_settle"].any():
+        return float(roi_df.loc[roi_df["in_settle"].astype(bool), "time_s"].max())
+    return 0.0
+
+
+# ── 1. Group time courses: every animal + group mean ─────────────────────────
+
+_EXCLUDED_GREY = "#ADB5BD"
+
+
+def _animal_label(stem: str) -> str:
+    from ..utils.naming import animal_from_stem
+    return animal_from_stem(stem)
+
+
+def _mean_sem_nan(rows):
+    mat = np.vstack(rows)
+    n = np.isfinite(mat).sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.where(n > 0, np.nansum(mat, axis=0) / np.maximum(n, 1), np.nan)
+        sd = np.sqrt(np.nansum((mat - mean) ** 2, axis=0) / np.maximum(n - 1, 1))
+        sem = np.where(n > 1, sd / np.sqrt(np.maximum(n, 1)), np.nan)
+    return mean, sem, n
+
+
+def build_timecourse(all_group_data: dict, kind: str = "delta") -> Figure:
+    """
+    Body temperature over time, one thin line per animal plus the group mean ± SEM.
+
+    kind="delta": change from the animal's own post-settling baseline, in °C;  kind="abs": °C.
+    Individual animals are drawn so n and between-animal spread are visible (SEM of a
+    handful of animals alone hides them).  Gaps are untracked periods, never dips;
+    animals excluded for low tracking coverage are dashed grey and not in the mean.
+    """
+    from matplotlib.lines import Line2D
+    norm = kind == "delta"
+    scale = 1.0
     fig, ax = _new_fig(figsize=(11, 5))
-    _style_ax(ax, "Time (s)", "Normalised ROI Max (Δ from baseline)",
-              "Normalised ROI Temperature — All Groups")
-
-    handles = []
+    _style_ax(ax, "Time since placement (s)",
+              "Δ body temperature from baseline (°C)" if norm else "Body temperature (°C)",
+              "Body temperature — change from baseline" if norm
+              else "Body temperature — absolute")
+    handles, settle = [], 0.0
     for g_name, gd in all_group_data.items():
-        if gd.common_t is None or gd.roi_mean is None:
+        if gd.common_t is None or not gd.animal_series:
             continue
-        t = gd.common_t
-        mean = gd.roi_mean
-        sem = gd.roi_sem if gd.roi_sem is not None else np.zeros_like(mean)
-        color = gd.color
-
-        ax.fill_between(t, mean - sem, mean + sem, alpha=_SEM_ALPHA, color=color)
-        line, = ax.plot(t, mean, color=color, lw=_LINE_W, label=g_name)
-
-        # Polynomial fit overlay
-        fit = poly_fit(t, smooth_series(mean), degree=POLY_DEGREE)
-        ax.plot(t, fit, color=color, lw=1.0, ls="--", alpha=0.7)
-
-        handles.append(mpatches.Patch(color=color, label=g_name))
-
-    ax.axhline(0, color=_GRID, lw=1.0, ls="-")
-    ax.legend(handles=handles)
+        t, color = gd.common_t, gd.color
+        rows = []
+        for stem, ser in gd.animal_series.items():
+            y = ser[kind] * scale
+            if ser["excluded"]:
+                ax.plot(t, y, color=_EXCLUDED_GREY, lw=1, ls="--", alpha=0.8,
+                        label=f"{g_name} · {_animal_label(stem)} (excluded)")
+            else:
+                ax.plot(t, y, color=color, lw=1.0, alpha=0.45,
+                        label=f"{g_name} · {_animal_label(stem)}")
+                rows.append(y)
+        if rows:
+            mean, sem, n = _mean_sem_nan(rows)
+            if len(rows) > 1:
+                ax.fill_between(t, mean - sem, mean + sem, color=color,
+                                alpha=_SEM_ALPHA, lw=0, label=f"{g_name} mean ± SEM")
+            ax.plot(t, mean, color=color, lw=2.8, label=f"{g_name} mean")
+            handles.append(Line2D([], [], color=color, lw=2.8,
+                                  label=f"{g_name} (n={len(rows)})"))
+        settle = max(settle, gd.settle_s)
+    if norm:
+        ax.axhline(0, color="#6C757D", lw=0.8)
+    _shade_settle(ax, settle)
+    handles.append(Line2D([], [], color="#6C757D", lw=1, alpha=0.6, label="individual animals"))
+    ax.legend(handles=handles, loc="best")
     fig.tight_layout(pad=1.5)
     return fig
 
 
-# ── 2. Rate of change of ROI (°C/min) ───────────────────────────────────────
-
-def build_rate_of_change(all_group_data: dict) -> Figure:
-    """ROI rate of change in °C/min, Gaussian-smoothed, multi-group."""
-    fig, ax = _new_fig(figsize=(11, 5))
-    _style_ax(ax, "Time (s)", "Rate of Change (°C / min)",
-              "ROI Temperature Rate of Change — All Groups")
-
-    handles = []
-    for g_name, gd in all_group_data.items():
-        if gd.common_t is None or gd.roi_mean is None:
-            continue
-        t = gd.common_t
-        roc = rate_of_change(t, gd.roi_mean)
-        roc_sem = (rate_of_change(t, gd.roi_sem)
-                   if gd.roi_sem is not None else np.zeros_like(roc))
-        color = gd.color
-
-        ax.fill_between(t, roc - abs(roc_sem), roc + abs(roc_sem),
-                        alpha=_SEM_ALPHA, color=color)
-        ax.plot(t, roc, color=color, lw=_LINE_W, label=g_name)
-        handles.append(mpatches.Patch(color=color, label=g_name))
-
-    ax.axhline(0, color=_GRID, lw=1.0, ls="-")
-    ax.legend(handles=handles)
-    fig.tight_layout(pad=1.5)
-    return fig
-
-
-# ── 3. ROI Max vs ROI Mean (per camera file) ─────────────────────────────────
-
-def build_roi_max_vs_mean(roi_df: pd.DataFrame, title: str = "") -> Figure:
-    """Per-camera ROI max (solid) vs ROI mean (dashed) with poly fit."""
-    fig, ax = _new_fig(figsize=(10, 4.5))
-    _style_ax(ax, "Time (s)", "Temperature (°C)",
-              title or "ROI Max vs ROI Mean")
-
-    t = roi_df["time_s"].to_numpy()
-    roi_max = roi_df["roi_max_smoothed"].to_numpy()
-    roi_mean = roi_df["roi_mean"].to_numpy()
-
-    ax.plot(t, roi_max, color=_ACCENT, lw=_LINE_W, label="ROI Max (smoothed)")
-    ax.plot(t, roi_mean, color="#E07B5A", lw=_LINE_W, ls="--", label="ROI Mean")
-
-    fit_max = poly_fit(t, roi_max, POLY_DEGREE)
-    ax.plot(t, fit_max, color=_ACCENT, lw=1.0, ls=":", alpha=0.8, label="Poly fit (Max)")
-
-    ax.legend()
-    fig.tight_layout(pad=1.5)
-    return fig
-
-
-# ── 4. Max pixel temperature (per camera) ────────────────────────────────────
-
-def build_max_pixel_temperature(roi_df: pd.DataFrame, title: str = "") -> Figure:
-    """Max pixel temperature with ±SEM band and polynomial fit."""
-    fig, ax = _new_fig(figsize=(10, 4.5))
-    _style_ax(ax, "Time (s)", "Temperature (°C)",
-              title or "Max Pixel Temperature")
-
-    t = roi_df["time_s"].to_numpy()
-    max_t = roi_df["max_temp"].to_numpy()
-    roi_max = roi_df["roi_max_smoothed"].to_numpy()
-
-    # Rolling SEM over 11-point window as proxy error band
-    sem_band = pd.Series(max_t).rolling(11, min_periods=1, center=True).std().fillna(0).to_numpy()
-
-    ax.fill_between(t, max_t - sem_band * 0.5, max_t + sem_band * 0.5,
-                    alpha=0.15, color="#E07B5A", label="±0.5 SD band")
-    ax.plot(t, max_t, color="#E07B5A", lw=_LINE_W, alpha=0.8, label="Max Pixel Temp")
-    ax.plot(t, roi_max, color=_ACCENT, lw=_LINE_W, ls="--", label="ROI Max (smoothed)")
-
-    fit = poly_fit(t, max_t, POLY_DEGREE)
-    ax.plot(t, fit, color="#E07B5A", lw=1.2, ls=":", label="Poly fit")
-
-    ax.legend()
-    fig.tight_layout(pad=1.5)
-    return fig
-
-
-# ── 5. Max pixel spatial trajectory ──────────────────────────────────────────
-
-def build_max_pixel_movement(roi_df: pd.DataFrame, cam_width: int,
-                              cam_height: int, title: str = "") -> Figure:
-    """Spatial trajectory + visit-frequency heatmap of the hottest pixel."""
-    fig, (ax1, ax2) = _new_fig(1, 2, figsize=(12, 5))
-    _style_ax(ax1, "Column (px)", "Row (px)", "Max Pixel Trajectory")
-    _style_ax(ax2, "Column (px)", "Row (px)", "Visit Frequency Heatmap")
-
-    rows = roi_df["max_row"].to_numpy().astype(int)
-    cols = roi_df["max_col"].to_numpy().astype(int)
-    temps = roi_df["max_temp"].to_numpy()
-
-    # In blob mode, missed frames are stored as row/col == -1 and temp == NaN.
-    # Filter them out so they don't corrupt the scatter or heatmap.
-    valid = (rows >= 0) & (cols >= 0) & np.isfinite(temps)
-    rows, cols, temps = rows[valid], cols[valid], temps[valid]
-
-    # ── Trajectory scatter (coloured by temperature) ──────────────────────
-    if len(rows) > 0:
-        sc = ax1.scatter(cols, rows, c=temps, cmap="inferno", s=6, alpha=0.6,
-                         vmin=temps.min(), vmax=temps.max())
-        ax1.plot(cols, rows, color="#C8D0CC", lw=0.5, alpha=0.4, zorder=0)
-        plt.colorbar(sc, ax=ax1, label="Temperature (°C)", shrink=0.85)
-    ax1.invert_yaxis()
-    ax1.set_xlim(0, cam_width)
-    ax1.set_ylim(cam_height, 0)
-
-    # ── Frequency heatmap ─────────────────────────────────────────────────
-    freq = np.zeros((cam_height, cam_width), dtype=np.float32)
-    if len(rows) > 0:
-        np.add.at(freq, (rows.clip(0, cam_height - 1), cols.clip(0, cam_width - 1)), 1)
-    freq_smooth = gaussian_filter1d(gaussian_filter1d(freq, sigma=1, axis=0), sigma=1, axis=1)
-    im = ax2.imshow(freq_smooth, origin="upper", cmap="hot",
-                    extent=[0, cam_width, cam_height, 0], aspect="auto")
-    plt.colorbar(im, ax=ax2, label="Visit count", shrink=0.85)
-
-    if title:
-        fig.suptitle(title, fontsize=_TITLE_SIZE, fontweight="bold", color=_TEXT)
-    fig.tight_layout(pad=1.5)
-    return fig
-
-
-# ── 6. Absolute temperature comparison ───────────────────────────────────────
-
-def build_absolute_comparison(all_group_data: dict) -> Figure:
-    """All groups' un-normalised ROI max on one axis for absolute temperature reference."""
-    fig, ax = _new_fig(figsize=(11, 5))
-    _style_ax(ax, "Time (s)", "ROI Max Temperature (°C)",
-              "Absolute ROI Max Temperature — All Groups")
-
-    handles = []
-    for g_name, gd in all_group_data.items():
-        # Reconstruct absolute mean from per-file dfs
-        roi_series = []
-        common_t_list = []
-        for stem, roi_df in gd.roi_dfs.items():
-            if len(roi_df) > 0:
-                roi_series.append(roi_df["roi_max"].to_numpy())
-                common_t_list.append(roi_df["time_s"].to_numpy())
-        if not roi_series:
-            continue
-
-        max_t = max(t[-1] for t in common_t_list)
-        t_common = np.arange(0, max_t, 30.0)
-        interp = [np.interp(t_common, ct, rs) for ct, rs in zip(common_t_list, roi_series)]
-        mean = np.mean(interp, axis=0)
-        sem = (np.std(interp, axis=0) / np.sqrt(len(interp))
-               if len(interp) > 1 else np.zeros_like(mean))
-
-        color = gd.color
-        ax.fill_between(t_common, mean - sem, mean + sem, alpha=_SEM_ALPHA, color=color)
-        ax.plot(t_common, mean, color=color, lw=_LINE_W, label=g_name)
-        handles.append(mpatches.Patch(color=color, label=g_name))
-
-    ax.legend(handles=handles)
-    fig.tight_layout(pad=1.5)
-    return fig
-
-
-# ── 7. Estimated T_core time series ──────────────────────────────────────────
+# ── 2. Estimated T_core ───────────────────────────────────────────────────────
 
 def build_tcore_estimated(all_group_data: dict) -> Figure:
-    """Dual panel: T_skin,max rolling avg (top) and estimated T_core (bottom)."""
+    """T_skin,max (top) and estimated T_core (bottom): animals + group mean ± SEM."""
+    from matplotlib.lines import Line2D
     fig, (ax1, ax2) = _new_fig(2, 1, figsize=(11, 8), sharex=True)
-    _style_ax(ax1, "", "T_skin,max (°C, 30-min rolling avg)",
-              "Skin Temperature Proxy (T_skin,max)")
-    _style_ax(ax2, "Time (s)", "Estimated T_core (°C)",
-              "Estimated Core Body Temperature")
-
-    handles = []
+    _style_ax(ax1, "", "T_skin,max per block (°C)", "Skin temperature proxy (T_skin,max)")
+    _style_ax(ax2, "Time since placement (s)", "Estimated T_core (°C)",
+              "Estimated core body temperature")
+    handles, settle = [], 0.0
     for g_name, gd in all_group_data.items():
-        # Build aligned list; skip None / too-short entries explicitly to avoid
-        # key-order mismatches when some files failed T_core estimation.
-        valid = [
-            (tdf["time_s"].to_numpy(),
-             tdf["tcore_estimated"].to_numpy(),
-             tdf["tskin_max"].to_numpy())
-            for tdf in gd.tcore_dfs.values()
-            if tdf is not None and len(tdf) >= 2
-        ]
-        if not valid:
+        series = [(s, v) for s, v in gd.animal_series.items() if "tcore" in v]
+        if not series or gd.common_t is None:
             continue
-
-        # Use the longest time axis as the common reference
-        t_ref = max(valid, key=lambda x: len(x[0]))[0]
-
-        tcore_mat = np.array([np.interp(t_ref, t, tc) for t, tc, _ in valid])
-        tskin_mat = np.array([np.interp(t_ref, t, ts) for t, _, ts in valid])
-
-        tc_mean = tcore_mat.mean(axis=0)
-        ts_mean = tskin_mat.mean(axis=0)
-
-        if len(valid) > 1:
-            tc_sem = tcore_mat.std(axis=0) / np.sqrt(len(valid))
-            ts_sem = tskin_mat.std(axis=0) / np.sqrt(len(valid))
-        else:
-            tc_sem = np.zeros_like(tc_mean)
-            ts_sem = np.zeros_like(ts_mean)
-
-        color = gd.color
-        ax1.fill_between(t_ref, ts_mean - ts_sem, ts_mean + ts_sem,
-                         alpha=_SEM_ALPHA, color=color)
-        ax1.plot(t_ref, ts_mean, color=color, lw=_LINE_W)
-
-        ax2.fill_between(t_ref, tc_mean - tc_sem, tc_mean + tc_sem,
-                         alpha=_SEM_ALPHA, color=color)
-        ax2.plot(t_ref, tc_mean, color=color, lw=_LINE_W, label=g_name)
-
-        handles.append(mpatches.Patch(color=color, label=g_name))
-
+        t, color = gd.common_t, gd.color
+        rows_c, rows_s = [], []
+        for stem, ser in series:
+            if ser["excluded"]:
+                continue
+            for ax, key, store in ((ax1, "tskin", rows_s), (ax2, "tcore", rows_c)):
+                ax.plot(t, ser[key], color=color, lw=1.0, alpha=0.45,
+                        label=f"{g_name} · {_animal_label(stem)}")
+                store.append(ser[key])
+        if rows_c:
+            for ax, rows in ((ax1, rows_s), (ax2, rows_c)):
+                mean, sem, _ = _mean_sem_nan(rows)
+                if len(rows) > 1:
+                    ax.fill_between(t, mean - sem, mean + sem, color=color,
+                                    alpha=_SEM_ALPHA, lw=0, label=f"{g_name} mean ± SEM")
+                ax.plot(t, mean, color=color, lw=2.8, label=f"{g_name} mean")
+            handles.append(Line2D([], [], color=color, lw=2.8,
+                                  label=f"{g_name} (n={len(rows_c)})"))
+        settle = max(settle, gd.settle_s)
+    _shade_settle(ax1, settle)
+    _shade_settle(ax2, settle)
     ax2.legend(handles=handles)
     fig.text(0.5, 0.01,
-             "T_core estimated via van der Vinne et al. (2020) Sci Rep 10:20680.\n"
-             "Group-average: slope=0.93, intercept=7.1°C. Between-animal error ≈ ±0.9°C.",
-             ha="center", va="bottom", fontsize=8, color="#6C757D", style="italic")
+             "T_core estimated via van der Vinne et al. (2020) Sci Rep 10:20680 "
+             "(slope 0.93, intercept 7.1 °C; between-animal error ≈ ±0.9 °C — use for within-animal "
+             "changes and group comparisons, not absolute core temperature).",
+             ha="center", va="bottom", fontsize=8, color="#6C757D", style="italic", wrap=True)
     fig.tight_layout(pad=1.5, rect=[0, 0.05, 1, 1])
     return fig
 
 
-# ── 8. T_core rate of change ─────────────────────────────────────────────────
+# ── 3. Per-animal overview ────────────────────────────────────────────────────
 
-def build_tcore_rate_of_change(all_group_data: dict) -> Figure:
-    """Rate of change of estimated T_core in °C/min."""
-    fig, ax = _new_fig(figsize=(11, 5))
-    _style_ax(ax, "Time (s)", "d(T_core_est) / dt  (°C / min)",
-              "Estimated Core Temperature Rate of Change — All Groups")
+def _runs(mask: np.ndarray, t: np.ndarray, min_len_s: float = 0.5):
+    """(start, end) times of runs where mask is True and lasting ≥ min_len_s."""
+    if not mask.any():
+        return []
+    d = np.diff(np.concatenate([[0], mask.astype(int), [0]]))
+    out = []
+    for s, e in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
+        t0, t1 = t[s], t[min(e, len(t) - 1)]
+        if t1 - t0 >= min_len_s:
+            out.append((t0, t1))
+    return out
 
-    handles = []
-    for g_name, gd in all_group_data.items():
-        if gd.common_t is None or gd.tcore_mean is None:
-            continue
-        t = gd.common_t
-        roc = rate_of_change(t, gd.tcore_mean)
-        color = gd.color
-        ax.plot(t, roc, color=color, lw=_LINE_W, label=g_name)
-        handles.append(mpatches.Patch(color=color, label=g_name))
 
-    ax.axhline(0, color=_GRID, lw=1.0)
-    ax.legend(handles=handles)
-    fig.tight_layout(pad=1.5)
+def build_animal_overview(roi_df: pd.DataFrame, title: str, cam_width: int,
+                          cam_height: int, qc: dict | None = None) -> Figure:
+    """
+    One figure per recording that shows everything needed to trust (or distrust) it:
+    temperature with untracked stretches marked, centroid speed, tracked/untracked
+    raster, and where the animal spent its time in view.
+    """
+    fig = plt.figure(figsize=(12.5, 7), facecolor=_PANEL_BG)
+    gs = fig.add_gridspec(3, 2, width_ratios=[2.7, 1], height_ratios=[3, 1.3, 0.55],
+                          hspace=0.14, wspace=0.16)
+    ax_t = fig.add_subplot(gs[0, 0])
+    ax_s = fig.add_subplot(gs[1, 0], sharex=ax_t)
+    ax_c = fig.add_subplot(gs[2, 0], sharex=ax_t)
+    ax_m = fig.add_subplot(gs[0, 1])
+    ax_b = fig.add_subplot(gs[1:, 1])
+    _style_ax(ax_t, "", "Body temperature (°C)")
+    _style_ax(ax_s, "", "Speed (px/s)")
+    _style_ax(ax_c, "Time since placement (s)", "")
+    _style_ax(ax_m, "Column (px)", "Row (px)", "Time in view")
+
+    t = roi_df["time_s"].to_numpy()
+    roi = roi_df["roi_max"].to_numpy()
+    valid = np.isfinite(roi)
+    settle = _settle_of(roi_df)
+    pauses = (roi_df.loc[roi_df["gap_before_s"] > 0, "time_s"].to_numpy()
+              if "gap_before_s" in roi_df.columns else np.array([]))
+
+    # untracked stretches
+    for a, b in _runs(~valid, t):
+        ax_t.axvspan(a, b, color="#E07B5A", alpha=0.18, lw=0, zorder=0)
+    ax_t.plot(t[valid], roi[valid], ".", ms=1.6, color="#9AA5A0", alpha=0.6,
+              label="tracked frames", zorder=1)
+    sm = (pd.Series(roi, index=pd.to_timedelta(t, unit="s"))
+          .rolling("5s", center=True, min_periods=3).median().to_numpy())
+    ax_t.plot(t, sm, color=_ACCENT, lw=2.0, label="body, 5-s rolling median", zorder=3)
+    if "head_max" in roi_df.columns and np.isfinite(roi_df["head_max"]).any():
+        hs = (pd.Series(roi_df["head_max"].to_numpy(), index=pd.to_timedelta(t, unit="s"))
+              .rolling("5s", center=True, min_periods=3).median().to_numpy())
+        ax_t.plot(t, hs, color="#E07B5A", lw=1.2, ls="--", label="head (secondary readout)",
+                  zorder=3)
+    post = t >= settle
+    edges = np.arange(settle, t[-1] + 30, 30.0)
+    cen, mu = [], []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        sel = (t >= lo) & (t < hi) & valid
+        if sel.sum() >= 0.2 * 30 * (len(t) / max(t[-1], 1)):
+            cen.append((lo + hi) / 2); mu.append(roi[sel].mean())
+    if cen:
+        ax_t.plot(cen, mu, "o-", color="#212529", lw=1.2, ms=4, zorder=4, label="30-s bin mean")
+    ax_t.plot([], [], color="#E07B5A", alpha=0.4, lw=8, label="body not tracked")
+    if len(pauses):
+        ax_t.plot([], [], color="#6C757D", lw=1, ls=":", label="recorder pause (cut out)")
+    ax_t.legend(loc="lower right", ncol=2, fontsize=8)
+    plt.setp(ax_t.get_xticklabels(), visible=False)
+
+    # speed
+    if "speed_px_s" in roi_df.columns:
+        sp = roi_df["speed_px_s"].to_numpy()
+        ax_s.plot(t, sp, color="#4C78A8", lw=0.8)
+        bl = roi_df.attrs.get("body_len_px")
+        if bl and np.isfinite(bl):
+            ax_s.axhline(0.25 * bl, color="#6C757D", lw=0.8, ls="--")
+            ax_s.text(t[0] + 0.5 * (t[-1] - t[0]), 0.25 * bl, "moving ≥ 0.25 body length/s", fontsize=7,
+                      color="#6C757D", va="bottom", ha="center", backgroundcolor="white")
+    plt.setp(ax_s.get_xticklabels(), visible=False)
+
+    # tracking raster
+    ax_c.fill_between(t, 0, 1, where=valid, step="mid", color=_ACCENT, alpha=0.7, lw=0)
+    ax_c.fill_between(t, 0, 1, where=~valid, step="mid", color="#E07B5A", alpha=0.7, lw=0)
+    ax_c.set_yticks([]); ax_c.set_ylim(0, 1); ax_c.grid(False)
+    ax_c.set_ylabel("tracked", fontsize=8)
+    for ax in (ax_t, ax_s, ax_c):
+        ax.set_xlim(t[0], t[-1])
+    for ax in (ax_t, ax_s, ax_c):
+        if settle > 0:
+            ax.axvspan(0, settle, color="#ADB5BD", alpha=0.18, lw=0, zorder=0)
+        for tp in pauses:        # thin marker only: the data simply continue after a pause
+            ax.axvline(tp, color="#6C757D", lw=1, ls=":", zorder=5)
+    if settle > 0:
+        ax_t.text(settle / 2, ax_t.get_ylim()[1], "settling\n(excluded)", ha="center",
+                  va="top", fontsize=7, color="#6C757D")
+
+    # occupancy
+    rows = roi_df["max_row"].to_numpy().astype(int)
+    cols = roi_df["max_col"].to_numpy().astype(int)
+    ok = (rows >= 0) & (cols >= 0)
+    freq = np.zeros((cam_height, cam_width), dtype=np.float32)
+    if ok.any():
+        np.add.at(freq, (rows[ok].clip(0, cam_height - 1), cols[ok].clip(0, cam_width - 1)), 1)
+    freq = gaussian_filter1d(gaussian_filter1d(freq, 1.5, axis=0), 1.5, axis=1)
+    im = ax_m.imshow(100 * freq / max(freq.sum(), 1), origin="upper", cmap="magma",
+                     extent=[0, cam_width, cam_height, 0], aspect="equal")
+    ax_m.grid(False)
+    plt.colorbar(im, ax=ax_m, label="% of tracked time per px", shrink=0.8)
+
+    # visibility check: does a window's temperature depend on how much of it was tracked?
+    flagged = bool(qc) and bias_flagged(qc)
+    wc, wm = [], []
+    fps_est = len(t) / max(t[-1], 1.0)
+    for lo in np.arange(settle, t[-1] - 15, 30.0):
+        sel = (t >= lo) & (t < lo + 30)
+        okw = sel & valid
+        frac = okw.sum() / max(sel.sum(), 1)
+        if frac >= 0.2 and okw.any():
+            wc.append(100 * frac); wm.append(roi[okw].mean())
+    _style_ax(ax_b, "Share of 30-s window tracked (%)",
+              "Window mean temperature (°C)", "Visibility check")
+    col = "#C0392B" if flagged else "#4C78A8"
+    ax_b.scatter(wc, wm, color=col, edgecolor="white", s=34, zorder=3)
+    if len(wc) >= 3 and np.ptp(wc) > 0:
+        k, c0 = np.polyfit(wc, wm, 1)
+        xx = np.array([min(wc), max(wc)])
+        ax_b.plot(xx, k * xx + c0, color=col, lw=1.4, ls="--")
+    ax_b.set_title("Visibility check" + (" — FLAGGED" if flagged else " — passed"),
+                   fontsize=10, color=col, fontweight="bold")
+
+    sub = []
+    if qc:
+        sub.append(f"tracked {qc.get('coverage_pct', float('nan')):.0f}% after settling")
+        if np.isfinite(qc.get("mean_roi_max", np.nan)):
+            sub.append(f"mean {qc['mean_roi_max']:.2f} °C")
+        if np.isfinite(qc.get("pct_time_moving", np.nan)):
+            sub.append(f"moving {qc['pct_time_moving']:.0f}% of tracked time")
+    fig.suptitle(title + ("\n" + "  ·  ".join(sub) if sub else ""), fontsize=_TITLE_SIZE,
+                 fontweight="bold", color=_TEXT)
+    note = bias_sentence(qc) if qc else ""
+    if note:
+        fig.text(0.07, 0.012, textwrap.fill(note, 170), fontsize=8.5, va="bottom",
+                 color="#C0392B" if flagged else "#6C757D")
+    fig.subplots_adjust(left=0.07, right=0.95, top=0.89, bottom=0.17 if note else 0.08)
+    keep = [c for c in ("time_s", "roi_max", "roi_mean", "body_valid", "body_area_px",
+                        "speed_px_s", "moving", "max_row", "max_col", "in_settle")
+            if c in roi_df.columns]
+    fig._glod_source = roi_df[keep].rename(columns={"max_row": "centroid_row",
+                                                    "max_col": "centroid_col"})
     return fig
+
+
+# ── 4. Tracking quality across animals ────────────────────────────────────────
+
+def build_tracking_qc(all_group_data: dict, qc_df: pd.DataFrame, min_coverage: float) -> Figure:
+    """Share of post-settling frames in which the body was tracked, per animal."""
+    qc = qc_df.reset_index(drop=True)
+    n = len(qc)
+    # Footnote: what the bars mean and why any animal carries a ⚠ — the flag is NOT about low
+    # coverage (a well-tracked animal can be flagged), so it is spelled out under the plot.
+    notes = ["Bars: share of the recording (after settling) in which the body was tracked — higher is better. "
+             "A ⚠ is a separate test: does an animal's temperature depend on how visible it was?"]
+    for r in qc.to_dict("records"):
+        if str(r.get("qc_flag", "")).startswith("CHECK"):
+            notes.append(f"{r['group']} · {r['animal']}: " + bias_sentence(r).replace("Why flagged: ", ""))
+        elif str(r.get("qc_flag", "")).startswith("EXCLUDED"):
+            notes.append(f"{r['group']} · {r['animal']}: {r['qc_flag']}.")
+    wrapped = "\n".join(textwrap.fill(s, 125, subsequent_indent="   ") for s in notes)
+    n_lines = wrapped.count("\n") + 1
+    fig, ax = _new_fig(figsize=(9.5, max(2.8, 0.38 * n + 1.5 + 0.2 * n_lines)))
+    _style_ax(ax, "Frames with body tracked after settling (%)", "", "Tracking quality")
+    y = np.arange(n)[::-1]
+    colors = [all_group_data[g].color if g in all_group_data else "#6C757D" for g in qc["group"]]
+    ax.barh(y, qc["coverage_pct"].fillna(0), color=colors, alpha=0.85, height=0.62, zorder=2)
+    ax.axvline(100 * min_coverage, color="#C0392B", lw=1.2, ls="--", zorder=3)
+    ax.text(100 * min_coverage + 1, -0.62, "exclusion threshold", color="#C0392B",
+            fontsize=8, va="center")
+    ax.set_ylim(-0.9, n - 0.4)
+    for yi, r in zip(y, qc.itertuples()):
+        flag = str(r.qc_flag)
+        mark = "✗ excluded" if flag.startswith("EXCLUDED") else "⚠ see note" if flag.startswith(
+            "CHECK") else ""
+        ax.text(min(float(r.coverage_pct) if np.isfinite(r.coverage_pct) else 0, 100) + 1,
+                yi, f"{r.coverage_pct:.0f}%  {mark}", va="center", fontsize=8, color=_TEXT)
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"{g} · {a}" for g, a in zip(qc["group"], qc["animal"])], fontsize=9)
+    ax.set_xlim(0, 118)
+    ax.grid(axis="y", visible=False)
+    bottom = min(0.55, (0.2 * n_lines + 0.25) / fig.get_figheight())
+    fig.tight_layout(pad=1.5, rect=[0, bottom, 1, 1])
+    fig.text(0.02, 0.01, wrapped, fontsize=8, va="bottom", color="#495057")
+    fig._glod_source = qc[[c for c in ("group", "animal", "recording", "coverage_pct", "longest_gap_s",
+                                       "tracking_bias_rho", "tracking_bias_p", "qc_flag")
+                           if c in qc.columns]]
+    return fig
+
+
+def _metric_grid(n: int, per_row: int = 3):
+    """Figure with up to ``per_row`` metric panels per row (constrained layout, so
+    labels stay clear of neighbouring panels when the canvas is resized)."""
+    ncols = min(n, per_row)
+    nrows = -(-n // per_row)
+    fig, axes = _new_fig(nrows, ncols, figsize=(4.3 * ncols, 5.0 * nrows),
+                         squeeze=False)
+    fig.set_layout_engine("constrained")
+    flat = list(axes.ravel())
+    for extra in flat[n:]:
+        extra.set_visible(False)
+    return fig, flat[:n]
 
 
 # ── 9. Group comparison bar charts ───────────────────────────────────────────
 
 _METRIC_LABELS = {
-    "peak_normalized_roi_max": "Peak Norm. ROI Max\n(Δ from baseline)",
-    "auc_normalized_roi_max":  "AUC Norm. ROI Max\n(Δ·s)",
-    "time_to_peak_s":          "Time to Peak (s)",
+    "mean_roi_max":            "Mean body temp.\n(°C, after settling)",
+    "mean_roi_max_resting":    "Mean body temp., resting\n(°C, not moving)",
+    "mean_head_roi_max":       "Mean head temp.\n(°C, secondary)",
+    "mean_normalized_roi_max": "Mean Δ from baseline\n(fraction)",
+    "peak_normalized_roi_max": "Peak Δ from baseline\n(fraction, 30-s bins)",
+    "slope_roi_max_c_per_min": "Temperature slope\n(°C/min)",
+    "mean_tcore_estimated":    "Mean T_core est. (°C)",
     "peak_tcore_estimated":    "Peak T_core est. (°C)",
-    "auc_tcore_estimated":     "AUC T_core est. (°C·s)",
+    "mean_speed_px_s":         "Mean speed (px/s)",
+    "pct_time_moving":         "Time moving (%)",
 }
 
 
@@ -375,12 +447,11 @@ def build_group_comparison_bars(all_group_data: dict, stats_results: dict) -> Fi
                 ha="center", va="center", transform=ax.transAxes)
         return fig
 
-    fig, axes = _new_fig(1, n_metrics, figsize=(3.5 * n_metrics, 5.5))
-    if n_metrics == 1:
-        axes = [axes]
+    fig, axes = _metric_grid(n_metrics)
 
     test_rows = stats_results.get("test_rows", [])
     ph_rows = stats_results.get("posthoc_rows", [])
+    paired = bool(stats_results.get("paired"))
 
     rng = np.random.default_rng(42)
 
@@ -405,13 +476,27 @@ def build_group_comparison_bars(all_group_data: dict, stats_results: dict) -> Fi
             ax.errorbar(g_idx, mean, yerr=sem, fmt="none", color=_TEXT,
                         capsize=5, linewidth=1.5, zorder=3)
 
-            # Jittered individual points
+            # Individual points (no jitter when paired, so lines connect cleanly)
             if len(vals) > 0:
-                jitter = rng.uniform(-0.12, 0.12, size=len(vals))
+                jitter = (np.zeros(len(vals)) if paired
+                          else rng.uniform(-0.12, 0.12, size=len(vals)))
                 ax.scatter(np.full(len(vals), g_idx) + jitter, vals,
                            color=color, edgecolors=_TEXT, linewidths=0.6,
                            s=28, zorder=4, alpha=0.9)
             bar_tops.append(mean + sem)
+
+        # Paired design: one line per animal across conditions
+        if paired:
+            sub = per_file_df[per_file_df["group"].isin(group_names)]
+            for _, rows_a in sub.groupby("file"):
+                pts = {group_names.index(r.group): getattr(r, metric)
+                       for r in rows_a.itertuples() if not pd.isna(getattr(r, metric))}
+                xs = sorted(pts)
+                if len(xs) > 1:
+                    ax.plot(xs, [pts[x] for x in xs], color="#6C757D",
+                            lw=0.9, alpha=0.7, zorder=3.5)
+            bar_tops += [float(np.nanmax(group_vals[g])) for g in group_names
+                         if len(group_vals.get(g, [])) > 0]
 
         # ── Significance brackets ─────────────────────────────────────────
         y_max = max(bar_tops) if bar_tops else 1.0
@@ -439,81 +524,94 @@ def build_group_comparison_bars(all_group_data: dict, stats_results: dict) -> Fi
 
     fig.suptitle("Group Comparison — Summary Metrics", fontsize=_TITLE_SIZE,
                  fontweight="bold", color=_TEXT)
-    fig.tight_layout(pad=1.5)
     return fig
 
 
-# ── 10. Violin + box plot ─────────────────────────────────────────────────────
+# ── 11. Time-point comparison bars ───────────────────────────────────────────
 
-def build_group_violin_box(all_group_data: dict, stats_results: dict) -> Figure:
-    """Violin + box plot overlay per metric showing distribution of per-file values."""
-    metrics = list(_METRIC_LABELS.keys())
-    n_metrics = len(metrics)
+def build_timepoint_bars(all_group_data: dict, stats_results: dict, settings) -> Figure:
+    """
+    Grouped bar chart: one cluster per user-set time point, one bar per group
+    (mean ± SEM, individual animals overlaid), with between-group significance
+    brackets taken from the time-point tests.
+    """
+    from ..processing.stats import TIMEPOINT_SIGNALS, timepoint_label
+
+    tp_df = stats_results.get("timepoint_df")
+    tps = [float(t) for t in settings.timepoints_s]
     group_names = list(all_group_data.keys())
     n_groups = len(group_names)
-    colors = [gd.color for gd in all_group_data.values()]
+    sig_name, unit = TIMEPOINT_SIGNALS.get(settings.timepoint_signal, ("", ""))
 
-    per_file_df = stats_results.get("per_file_df")
-    if per_file_df is None or per_file_df.empty:
-        fig, ax = _new_fig()
-        ax.text(0.5, 0.5, "No data for violin plot",
+    fig, ax = _new_fig(figsize=(max(6.0, 2.6 * len(tps) + 2.0), 5.2))
+    if tp_df is None or tp_df.empty:
+        ax.text(0.5, 0.5, "No data for time-point comparison",
                 ha="center", va="center", transform=ax.transAxes)
         return fig
 
-    fig, axes = _new_fig(1, n_metrics, figsize=(3.5 * n_metrics, 5.5))
-    if n_metrics == 1:
-        axes = [axes]
+    _style_ax(ax, "", f"{sig_name} ({unit})")
+    width = 0.8 / n_groups
+    rng = np.random.default_rng(42)
+    ph = (stats_results.get("timepoint_test_rows", [])
+          + stats_results.get("timepoint_posthoc_rows", []))
+    tops = {}
+    paired = bool(stats_results.get("paired"))
 
-    ph_rows = stats_results.get("posthoc_rows", []) or stats_results.get("test_rows", [])
+    for ti, t in enumerate(tps):
+        label = timepoint_label(t)
+        tops[ti] = []
+        for gi, (g, gd) in enumerate(all_group_data.items()):
+            vals = tp_df[(tp_df.group == g) & (tp_df.timepoint_s == t)]["value"] \
+                .dropna().to_numpy()
+            x = ti + (gi - (n_groups - 1) / 2) * width
+            mean = float(np.mean(vals)) if len(vals) else np.nan
+            sem = float(np.std(vals, ddof=1) / np.sqrt(len(vals))) if len(vals) > 1 else 0.0
+            if len(vals):
+                ax.bar(x, mean, width=width * 0.9, color=gd.color, alpha=0.75,
+                       edgecolor="white", linewidth=1.0, zorder=2,
+                       label=g if ti == 0 else None)
+                ax.errorbar(x, mean, yerr=sem, fmt="none", color=_TEXT,
+                            capsize=4, linewidth=1.4, zorder=3)
+                jit = (np.zeros(len(vals)) if paired
+                       else rng.uniform(-width * 0.2, width * 0.2, len(vals)))
+                ax.scatter(x + jit, vals,
+                           color=gd.color, edgecolors=_TEXT, linewidths=0.6,
+                           s=24, zorder=4, alpha=0.9)
+                tops[ti].append(mean + sem)
 
-    for ax_idx, metric in enumerate(metrics):
-        ax = axes[ax_idx]
-        _style_ax(ax, "", _METRIC_LABELS[metric])
-        ax.set_xticks(range(n_groups))
-        ax.set_xticklabels(group_names, rotation=20, ha="right", fontsize=9)
+        # Paired design: connect each animal across conditions at this time point
+        if paired:
+            sub = tp_df[tp_df.timepoint_s == t]
+            for _, rows_a in sub.groupby("file"):
+                pts = [(ti + (group_names.index(r.group) - (n_groups - 1) / 2) * width,
+                        r.value) for r in rows_a.itertuples() if not pd.isna(r.value)]
+                if len(pts) > 1:
+                    pts.sort()
+                    ax.plot(*zip(*pts), color="#6C757D", lw=0.9, alpha=0.7, zorder=3.5)
+                    tops[ti].append(max(v for _, v in pts))
 
-        group_vals = []
-        bar_tops = []
-        for g_name in group_names:
-            vals = per_file_df.loc[per_file_df["group"] == g_name, metric].dropna().to_numpy()
-            group_vals.append(vals)
-            bar_tops.append(vals.max() if len(vals) > 0 else 0.0)
-
-        for g_idx, (vals, color) in enumerate(zip(group_vals, colors)):
-            if len(vals) >= 3:
-                parts = ax.violinplot([vals], positions=[g_idx], widths=0.5,
-                                       showmedians=False, showextrema=False)
-                for pc in parts["bodies"]:
-                    pc.set_facecolor(color)
-                    pc.set_alpha(0.35)
-                    pc.set_edgecolor("none")
-
-            if len(vals) > 0:
-                ax.boxplot([vals], positions=[g_idx], widths=0.28,
-                                patch_artist=True, notch=False,
-                                boxprops=dict(facecolor=color, alpha=0.6,
-                                              edgecolor=_TEXT, linewidth=1.2),
-                                medianprops=dict(color="white", linewidth=2),
-                                whiskerprops=dict(color=_TEXT, linewidth=1.2),
-                                capprops=dict(color=_TEXT, linewidth=1.2),
-                                flierprops=dict(marker="o", color=color,
-                                                markersize=4, alpha=0.6))
-
-        # Significance brackets
-        y_max = max(bar_tops) if bar_tops else 1.0
-        y_bracket = y_max * 1.08
-        for row in ph_rows:
-            if row.get("metric") != metric:
+        # Brackets for this time point (2 groups: test row; 3+: post-hoc rows)
+        y0 = max(tops[ti]) if tops[ti] else 0.0
+        span = (ax.get_ylim()[1] - ax.get_ylim()[0]) or 1.0
+        y = y0 + span * 0.04
+        for r in ph:
+            if r.get("timepoint") != label:
                 continue
-            sig = row.get("significance", "ns")
-            gA, gB = row.get("group_A", ""), row.get("group_B", "")
+            gA, gB = r.get("group_A", ""), r.get("group_B", "")
             if gA not in group_names or gB not in group_names:
                 continue
-            _sig_bracket(ax, group_names.index(gA), group_names.index(gB),
-                         y_bracket, sig)
-            y_bracket *= 1.12
+            xa = ti + (group_names.index(gA) - (n_groups - 1) / 2) * width
+            xb = ti + (group_names.index(gB) - (n_groups - 1) / 2) * width
+            _sig_bracket(ax, xa, xb, y, r.get("significance", "ns"), color=_TEXT)
+            y += span * 0.08
 
-    fig.suptitle("Group Distribution — Violin + Box Plots", fontsize=_TITLE_SIZE,
-                 fontweight="bold", color=_TEXT)
+    ax.set_xticks(range(len(tps)))
+    ax.set_xticklabels([timepoint_label(t) for t in tps], fontsize=_LABEL_SIZE)
+    ax.margins(y=0.15)
+    if n_groups > 1:
+        ax.legend(loc="best")
+    ax.set_title(f"Temperature at set time points — mean ± SEM, "
+                 f"{settings.timepoint_window_s:g}-s window",
+                 fontsize=_TITLE_SIZE, fontweight="bold", color=_TEXT, pad=8)
     fig.tight_layout(pad=1.5)
     return fig

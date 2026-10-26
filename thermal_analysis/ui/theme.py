@@ -1,5 +1,12 @@
 """Scandinavian Light theme for Glöd."""
 
+from pathlib import Path
+
+# White tick drawn onto checked checkboxes (Qt stylesheets need an image file)
+CHECK_ICON = (Path(__file__).parent / "assets" / "check.png").as_posix()
+ARROW_UP = (Path(__file__).parent / "assets" / "arrow_up.png").as_posix()
+ARROW_DOWN = (Path(__file__).parent / "assets" / "arrow_down.png").as_posix()
+
 # ── Palette ──────────────────────────────────────────────────────────────────
 BG = "#F8F9FA"          # warm off-white window background
 PANEL = "#EEF2F0"       # light sage panel / sidebar
@@ -57,6 +64,58 @@ QGroupBox::title {{
     font-weight: 700;
     letter-spacing: 0.5px;
     text-transform: uppercase;
+}}
+
+/* ── Collapsible sections ────────────────────────────────── */
+QPushButton#SectionHeader {{
+    background-color: {CARD};
+    color: {TEXT};
+    border: 1px solid {BORDER};
+    border-radius: 5px;
+    padding: 4px 10px;
+    text-align: left;
+    font-weight: 600;
+    min-height: 24px;
+}}
+
+QPushButton#SectionHeader:hover {{
+    background-color: {CARD};
+    border-color: {ACCENT};
+}}
+
+QWidget#ActionsBar {{
+    background-color: {PANEL};
+    border-top: 1px solid {BORDER};
+}}
+
+QWidget#ControlPanel {{
+    background-color: {PANEL};
+}}
+
+QFrame#SectionBody {{
+    background-color: {PANEL};
+    border: none;
+}}
+
+/* ── Phase switch (Record / Analyse) ─────────────────────── */
+QPushButton#PhaseButton {{
+    background-color: transparent;
+    color: {TEXT_MUTED};
+    border: 1.5px solid {BORDER};
+    border-radius: 0px;
+    padding: 4px 18px;
+    min-height: 24px;
+}}
+
+QPushButton#PhaseButton:checked {{
+    background-color: {ACCENT};
+    color: #FFFFFF;
+    border-color: {ACCENT};
+}}
+
+QPushButton#PhaseButton:hover:!checked {{
+    color: {ACCENT};
+    border-color: {ACCENT};
 }}
 
 /* ── Buttons ─────────────────────────────────────────────── */
@@ -160,12 +219,42 @@ QComboBox::drop-down {{
 }}
 
 QComboBox::down-arrow {{
-    image: none;
-    width: 10px;
-    height: 10px;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 6px solid {TEXT_MUTED};
+    image: url({ARROW_DOWN});
+    width: 12px;
+    height: 12px;
+}}
+
+QSpinBox, QDoubleSpinBox {{
+    padding-right: 20px;
+    min-width: 58px;
+}}
+
+QSpinBox::up-button, QDoubleSpinBox::up-button {{
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 18px;
+    border: none;
+    border-left: 1px solid {BORDER};
+}}
+
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 18px;
+    border: none;
+    border-left: 1px solid {BORDER};
+}}
+
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+    image: url({ARROW_UP});
+    width: 9px;
+    height: 9px;
+}}
+
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+    image: url({ARROW_DOWN});
+    width: 9px;
+    height: 9px;
 }}
 
 QComboBox QAbstractItemView {{
@@ -213,6 +302,10 @@ QCheckBox {{
     spacing: 6px;
 }}
 
+QCheckBox, QRadioButton {{
+    background: transparent;
+}}
+
 QCheckBox::indicator {{
     width: 16px;
     height: 16px;
@@ -224,11 +317,7 @@ QCheckBox::indicator {{
 QCheckBox::indicator:checked {{
     background-color: {ACCENT};
     border-color: {ACCENT};
-    image: none;
-}}
-
-QCheckBox::indicator:checked::after {{
-    content: "";
+    image: url({CHECK_ICON});
 }}
 
 /* ── Radio buttons ───────────────────────────────────────── */
@@ -476,6 +565,28 @@ QPushButton#StopRecordButton:hover {{
 QPushButton#StopRecordButton:disabled {{
     background-color: #ADB5BD;
     color: #F8F9FA;
+}}
+
+QPushButton#PauseRecordButton {{
+    background-color: {WARNING};
+    color: #FFFFFF;
+    border: none;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 15px;
+    min-height: 46px;
+}}
+
+QPushButton#PauseRecordButton:hover {{
+    background-color: #CF6D12;
+}}
+
+QPushButton#PauseRecordButton[paused="true"] {{
+    background-color: {SUCCESS};
+}}
+
+QPushButton#PauseRecordButton[paused="true"]:hover {{
+    background-color: #1F8F4E;
 }}
 
 /* ── Section divider label ──────────────────────────────── */

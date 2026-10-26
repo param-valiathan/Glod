@@ -74,11 +74,23 @@ class CaptureWorker(QThread):
         self._port_obj      = port_obj
         self._preview_only  = preview_only
         self._stop_event    = threading.Event()
+        self._pause_event   = threading.Event()   # set = paused (stream stays live, frames not kept)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
     def stop(self):
         self._stop_event.set()
+
+    def pause(self):
+        """Stop keeping frames; the camera keeps streaming so the preview stays live."""
+        self._pause_event.set()
+
+    def resume(self):
+        self._pause_event.clear()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._pause_event.is_set()
 
     @property
     def camera_id(self) -> str:
@@ -134,6 +146,9 @@ class CaptureWorker(QThread):
         frame_n = 0
         buf: list = []
         consecutive_errors = 0
+        pause_start: Optional[datetime] = None
+        paused_total = 0.0
+        elapsed_active = 0.0
 
         while not self._stop_event.is_set():
             try:
@@ -161,7 +176,24 @@ class CaptureWorker(QThread):
             if t0 is None:
                 t0 = now
 
-            elapsed = (now - t0).total_seconds()
+            # Pause: keep draining the camera (live preview, no reconnect) but record nothing.
+            # ``elapsed`` and the duration limit count recorded time only; the saved timestamps
+            # stay real time (provenance); the analysis cuts the pause out of the time axis.
+            if self._pause_event.is_set():
+                if pause_start is None:
+                    pause_start = now
+                    self.log_message.emit(
+                        f"[{self._camera_id}] Paused at {elapsed_active:.0f} s of recording.")
+                self.frame_ready.emit(self._camera_id, frame.copy(), elapsed_active)
+                continue
+            if pause_start is not None:
+                gap = (now - pause_start).total_seconds()
+                paused_total += gap
+                pause_start = None
+                self.log_message.emit(
+                    f"[{self._camera_id}] Resumed after a {gap:.0f} s pause.")
+
+            elapsed = elapsed_active = (now - t0).total_seconds() - paused_total
             if elapsed > self._duration_s:
                 break
 
